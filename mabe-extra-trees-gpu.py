@@ -444,42 +444,6 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None,
         # ---- tracking ----
         path = f"{traintest_directory}/{lab_id}/{video_id}.parquet"
         vid = pd.read_parquet(path)
-
-        # ---- denoise / impute tracking ----
-        if 'likelihood' in vid.columns:
-            # keep frames but null-out low confidence points for interpolation
-            low_conf = vid['likelihood'] < 0.02
-            vid.loc[low_conf, ['x', 'y']] = np.nan
-
-        # sort so interpolation respects time
-        vid = vid.sort_values(['mouse_id', 'bodypart', 'video_frame'])
-        if {'x', 'y'}.issubset(vid.columns):
-            vid[['x', 'y']] = vid.groupby(['mouse_id', 'bodypart'])[['x', 'y']].transform(
-                lambda s: s.interpolate(limit_direction='both')
-            )
-
-            # Savitzky–Golay smoothing per keypoint to reduce jitter
-            def _smooth_group(df_g, window=9, poly=2):
-                n = len(df_g)
-                if n <= poly + 2:
-                    return df_g[['x', 'y']].to_numpy()
-                # ensure odd window and not larger than group length
-                win = min(window if window % 2 == 1 else window + 1, n if n % 2 == 1 else n - 1)
-                if win <= poly + 2:
-                    return df_g[['x', 'y']].to_numpy()
-                x_sm = signal.savgol_filter(df_g['x'].to_numpy(), window_length=win, polyorder=poly, mode='interp')
-                y_sm = signal.savgol_filter(df_g['y'].to_numpy(), window_length=win, polyorder=poly, mode='interp')
-                return np.column_stack([x_sm, y_sm])
-
-            smoothed_blocks = []
-            for _, g in vid.groupby(['mouse_id', 'bodypart'], sort=False):
-                sm = _smooth_group(g)
-                smoothed_blocks.append(pd.DataFrame(sm, index=g.index, columns=['x', 'y']))
-            if smoothed_blocks:
-                vid[['x', 'y']] = pd.concat(smoothed_blocks).sort_index()
-
-        # restore chronological order for downstream pivot
-        vid = vid.sort_values('video_frame')
         if len(np.unique(vid.bodypart)) > 5:
             vid = vid.query("~ bodypart.isin(@drop_body_parts)")
         pvid = vid.pivot(columns=['mouse_id','bodypart'], index='video_frame', values=['x','y'])
@@ -1412,5 +1376,6 @@ submission_robust = robustify(submission, test, 'test')
 submission_robust.index.name = 'row_id'
 submission_robust.to_csv('submission.csv')
 print(f"\nSubmission created: {len(submission_robust)} predictions")
+
 
 
