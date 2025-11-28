@@ -1062,6 +1062,14 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         dir_B = mouse_pair['B']['nose'] - mouse_pair['B']['tail_base']
         X['rel_ori'] = (dir_A['x'] * dir_B['x'] + dir_A['y'] * dir_B['y']) / (
             np.sqrt(dir_A['x']**2 + dir_A['y']**2) * np.sqrt(dir_B['x']**2 + dir_B['y']**2) + 1e-6)
+        # Head-to-head alignment (parallel vs antiparallel vs orthogonal)
+        head_dot = (dir_A['x'] * dir_B['x'] + dir_A['y'] * dir_B['y'])
+        head_den = (np.sqrt(dir_A['x']**2 + dir_A['y']**2) * np.sqrt(dir_B['x']**2 + dir_B['y']**2) + 1e-6)
+        head_cos = head_dot / head_den
+        X['head_cos'] = head_cos
+        X['head_parallel'] = (head_cos > 0.5).astype(float)
+        X['head_antipar'] = (head_cos < -0.5).astype(float)
+        X['head_side'] = ((head_cos >= -0.5) & (head_cos <= 0.5)).astype(float)
 
         def _ang(dx, dy):
             return np.arctan2(dy, dx)
@@ -1151,12 +1159,41 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
     if 'nose' in avail_A and 'nose' in avail_B:
         nn = np.sqrt((mouse_pair['A']['nose']['x'] - mouse_pair['B']['nose']['x'])**2 +
                      (mouse_pair['A']['nose']['y'] - mouse_pair['B']['nose']['y'])**2)
-        for lag in [10, 20, 40]:
+        for lag in [1,2,3,4,5,6,7,8,9,10, 20, 30, 40, 50, 60, 70,80,90,100]:
             l = _scale(lag, fps)
             X[f'nn_lg{lag}']  = nn.shift(l)
             X[f'nn_ch{lag}']  = nn - nn.shift(l)
             is_cl = (nn < 10.0).astype(float)
             X[f'cl_ps{lag}']  = is_cl.rolling(l, min_periods=1).mean()
+
+        # Nose approach vs lateral slip (cm/s; >0 means separating along radial line)
+        rel_x = mouse_pair['A']['nose']['x'] - mouse_pair['B']['nose']['x']
+        rel_y = mouse_pair['A']['nose']['y'] - mouse_pair['B']['nose']['y']
+        Avx = mouse_pair['A']['nose']['x'].diff()
+        Avy = mouse_pair['A']['nose']['y'].diff()
+        Bvx = mouse_pair['B']['nose']['x'].diff()
+        Bvy = mouse_pair['B']['nose']['y'].diff()
+        rel_den = (nn + 1e-6)
+        rv = ((Avx - Bvx) * rel_x + (Avy - Bvy) * rel_y) / rel_den
+        lv = ((Avx - Bvx) * (-rel_y) + (Avy - Bvy) * rel_x) / rel_den
+        X['nn_rad_sp'] = (rv * float(fps)).fillna(0)
+        X['nn_lat_sp'] = (lv * float(fps)).fillna(0)
+
+        # Nose speeds and imbalance (cm/s)
+        A_sp = np.sqrt(Avx**2 + Avy**2) * float(fps)
+        B_sp = np.sqrt(Bvx**2 + Bvy**2) * float(fps)
+        X['nose_spdA'] = A_sp
+        X['nose_spdB'] = B_sp
+        X['nose_spd_gap'] = (A_sp - B_sp)
+
+        # Rolling proximity stats and multi-threshold contact ratios
+        roll_opts = dict(min_periods=1, center=True)
+        for w in [5, 15, 45]:
+            ws = _scale(w, fps)
+            X[f'nn_mean{w}'] = nn.rolling(ws, **roll_opts).mean()
+            X[f'nn_std{w}']  = nn.rolling(ws, **roll_opts).std()
+            for thr in (8.0, 12.0, 15.0):
+                X[f'nn_ct{int(thr)}_{w}'] = (nn < thr).rolling(ws, **roll_opts).mean()
 
     # Velocity alignment (duration-aware offsets)
     if 'body_center' in avail_A and 'body_center' in avail_B:
@@ -1166,7 +1203,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         Bvy = mouse_pair['B']['body_center']['y'].diff()
         val = (Avx * Bvx + Avy * Bvy) / (np.sqrt(Avx**2 + Avy**2) * np.sqrt(Bvx**2 + Bvy**2) + 1e-6)
 
-        for off in [-20, -10, 0, 10, 20]:
+        for off in [-30,-20,-15,-10,-5, 0,5, 10,15, 20,30]:
             o = _scale_signed(off, fps)
             X[f'va_{off}'] = val.shift(-o)
 
@@ -1483,6 +1520,5 @@ submission_robust = robustify(submission, test, 'test')
 submission_robust.index.name = 'row_id'
 submission_robust.to_csv('submission.csv')
 print(f"\nSubmission created: {len(submission_robust)} predictions")
-
 
 
