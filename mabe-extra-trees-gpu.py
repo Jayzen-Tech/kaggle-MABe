@@ -580,7 +580,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None,
 def predict_multiclass_adaptive(pred, meta, action_thresholds=defaultdict(lambda: 0.27)):
     """Adaptive thresholding per action + temporal smoothing"""
     # Apply temporal smoothing
-    pred_smoothed = pred.rolling(window=5, min_periods=1, center=True).mean()
+    pred_smoothed = pred.rolling(window=7, min_periods=1, center=True).mean()
     
     ama = np.argmax(pred_smoothed, axis=1)
     
@@ -956,14 +956,28 @@ def transform_single(single_mouse, body_parts_tracked, fps):
 
     # Speed-like features via lagged displacements (duration-aware lag)
     if all(p in single_mouse.columns for p in ['ear_left', 'ear_right', 'tail_base']):
-        lag = _scale(10, fps)
-        shifted = single_mouse[['ear_left', 'ear_right', 'tail_base']].shift(lag)
-        speeds = pd.DataFrame({
-            'sp_lf': np.square(single_mouse['ear_left'] - shifted['ear_left']).sum(axis=1, skipna=False),
-            'sp_rt': np.square(single_mouse['ear_right'] - shifted['ear_right']).sum(axis=1, skipna=False),
-            'sp_lf2': np.square(single_mouse['ear_left'] - shifted['tail_base']).sum(axis=1, skipna=False),
-            'sp_rt2': np.square(single_mouse['ear_right'] - shifted['tail_base']).sum(axis=1, skipna=False),
-        })
+        speed_lags = [1,2,3,4,5, 10, 20, 30,40,50,60]
+        speed_parts = []
+        for lag_base in speed_lags:
+            lag = _scale(lag_base, fps)
+            shifted = single_mouse[['ear_left', 'ear_right', 'tail_base']].shift(lag)
+            suf = f"l{lag_base}"
+            speed_parts.append(pd.DataFrame({
+                f'sp_lf_{suf}': np.square(single_mouse['ear_left'] - shifted['ear_left']).sum(axis=1, skipna=False),
+                f'sp_rt_{suf}': np.square(single_mouse['ear_right'] - shifted['ear_right']).sum(axis=1, skipna=False),
+                f'sp_lf2_{suf}': np.square(single_mouse['ear_left'] - shifted['tail_base']).sum(axis=1, skipna=False),
+                f'sp_rt2_{suf}': np.square(single_mouse['ear_right'] - shifted['tail_base']).sum(axis=1, skipna=False),
+            }))
+
+        speeds = pd.concat(speed_parts, axis=1)
+        # Keep original names for backward compatibility (based on 10-frame base lag)
+        if 'sp_lf_l10' in speeds:
+            speeds = speeds.assign(
+                sp_lf=speeds['sp_lf_l10'],
+                sp_rt=speeds['sp_rt_l10'],
+                sp_lf2=speeds['sp_lf2_l10'],
+                sp_rt2=speeds['sp_rt2_l10'],
+            )
         X = pd.concat([X, speeds], axis=1)
 
     if 'nose+tail_base' in X.columns and 'ear_left+ear_right' in X.columns:
@@ -1043,18 +1057,27 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
 
     # Speed-like features via lagged displacements (duration-aware lag)
     if ('A', 'ear_left') in mouse_pair.columns and ('B', 'ear_left') in mouse_pair.columns:
-        lag = _scale(10, fps)
-        shA = mouse_pair['A']['ear_left'].shift(lag)
-        shB = mouse_pair['B']['ear_left'].shift(lag)
-        speeds = pd.DataFrame({
-            'sp_A': np.square(mouse_pair['A']['ear_left'] - shA).sum(axis=1, skipna=False),
-            'sp_AB': np.square(mouse_pair['A']['ear_left'] - shB).sum(axis=1, skipna=False),
-            'sp_B': np.square(mouse_pair['B']['ear_left'] - shB).sum(axis=1, skipna=False),
-        })
-        X = pd.concat([X, speeds], axis=1)
+        speed_lags = [5, 10, 20, 30]
+        speed_parts = []
+        for lag_base in speed_lags:
+            lag = _scale(lag_base, fps)
+            shA = mouse_pair['A']['ear_left'].shift(lag)
+            shB = mouse_pair['B']['ear_left'].shift(lag)
+            suf = f"l{lag_base}"
+            speed_parts.append(pd.DataFrame({
+                f'sp_A_{suf}': np.square(mouse_pair['A']['ear_left'] - shA).sum(axis=1, skipna=False),
+                f'sp_AB_{suf}': np.square(mouse_pair['A']['ear_left'] - shB).sum(axis=1, skipna=False),
+                f'sp_B_{suf}': np.square(mouse_pair['B']['ear_left'] - shB).sum(axis=1, skipna=False),
+            }))
 
-    if 'nose+tail_base' in X.columns and 'ear_left+ear_right' in X.columns:
-        X['elong'] = X['nose+tail_base'] / (X['ear_left+ear_right'] + 1e-6)
+        speeds = pd.concat(speed_parts, axis=1)
+        if 'sp_A_l10' in speeds:
+            speeds = speeds.assign(
+                sp_A=speeds['sp_A_l10'],
+                sp_AB=speeds['sp_AB_l10'],
+                sp_B=speeds['sp_B_l10'],
+            )
+        X = pd.concat([X, speeds], axis=1)
 
     # Relative orientation
     if all(p in avail_A for p in ['nose', 'tail_base', 'body_center']) and all(p in avail_B for p in ['nose', 'tail_base', 'body_center']):
@@ -1182,9 +1205,15 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         # Nose speeds and imbalance (cm/s)
         A_sp = np.sqrt(Avx**2 + Avy**2) * float(fps)
         B_sp = np.sqrt(Bvx**2 + Bvy**2) * float(fps)
+        gap_sp = (A_sp - B_sp)
         X['nose_spdA'] = A_sp
         X['nose_spdB'] = B_sp
-        X['nose_spd_gap'] = (A_sp - B_sp)
+        X['nose_spd_gap'] = gap_sp
+        for lag in [5, 10, 20, 30]:
+            l = _scale(lag, fps)
+            X[f'nose_spdA_lg{lag}'] = A_sp.shift(l)
+            X[f'nose_spdB_lg{lag}'] = B_sp.shift(l)
+            X[f'nose_spd_gap_lg{lag}'] = gap_sp.shift(l)
 
         # Rolling proximity stats and multi-threshold contact ratios
         roll_opts = dict(min_periods=1, center=True)
@@ -1203,7 +1232,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         Bvy = mouse_pair['B']['body_center']['y'].diff()
         val = (Avx * Bvx + Avy * Bvy) / (np.sqrt(Avx**2 + Avy**2) * np.sqrt(Bvx**2 + Bvy**2) + 1e-6)
 
-        for off in [-30,-20,-15,-10,-5, 0,5, 10,15, 20,30]:
+        for off in [-20, -10, 10, 20]:
             o = _scale_signed(off, fps)
             X[f'va_{off}'] = val.shift(-o)
 
@@ -1520,5 +1549,3 @@ submission_robust = robustify(submission, test, 'test')
 submission_robust.index.name = 'row_id'
 submission_robust.to_csv('submission.csv')
 print(f"\nSubmission created: {len(submission_robust)} predictions")
-
-
