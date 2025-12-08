@@ -13,14 +13,12 @@ import warnings
 import json
 import os, random
 import gc, re, math
-import hashlib
-import joblib
+import lightgbm
 from collections import defaultdict
 import polars as pl
 from scipy import signal, stats
 from typing import Dict, Optional, Tuple
 from time import perf_counter 
-import optuna
 from sklearn.base import ClassifierMixin, BaseEstimator, clone
 from sklearn.model_selection import cross_val_predict, GroupKFold, StratifiedKFold
 from sklearn.pipeline import make_pipeline
@@ -32,21 +30,17 @@ USE_GPU = ("KAGGLE_KERNEL_RUN_TYPE" in __import__("os").environ) and (__import__
 print(f'Using GPU? {USE_GPU}')
 
 from xgboost import XGBClassifier
-
+from catboost import CatBoostClassifier
+ 
 SEED = 1234
-N_CUT = 1_000_000_000
-LEAST_POS_PERC = 0.0
-_safe_token = re.compile(r'[^A-Za-z0-9]+')
-# ---- runtime switches ----
-ONLY_TUNE_THRESHOLDS = False     # True: only search thresholds and save; skip training/inference/submission
-USE_ADAPTIVE_THRESHOLDS = True   # False: use constant 0.27 for all actions, skip tuning/loading
-LOAD_THRESHOLDS = False          # True: load thresholds from THRESHOLD_DIR instead of tuning
-LOAD_MODELS = False              # True: load models from MODEL_DIR instead of training
-CHECK_LOAD = True
-THRESHOLD_DIR = "./threshold"            # save thresholds here
-MODEL_DIR = "./models"                  # save models here
-THRESHOLD_LOAD_DIR = THRESHOLD_DIR      # load thresholds from here
-MODEL_LOAD_DIR = MODEL_DIR              # load models from here
+
+# %%
+
+# MODIFIED: imports for ST-GCN
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
 
 # %%
 # --- SEED EVERYTHING -----
@@ -56,20 +50,30 @@ rnd = np.random.RandomState(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
 
+def _make_lgbm(**kw):
+    kw.setdefault("random_state", SEED)
+    # kw.setdefault("deterministic", True)
+    # kw.setdefault("force_row_wise", True) 
+    kw.setdefault("feature_fraction_seed", SEED)
+    kw.setdefault("data_random_seed", SEED)
+    kw.setdefault("device", 'gpu' if USE_GPU else 'cpu')
+    return lightgbm.LGBMClassifier(**kw)
+
 def _make_xgb(**kw):
     kw.setdefault("random_state", SEED)
     kw.setdefault("tree_method", "gpu_hist" if USE_GPU else "hist")
     # kw.setdefault("deterministic_histogram", True)
     return XGBClassifier(**kw)
 
-def _slugify(text: str) -> str:
-    """Make a filename-safe slug from the body_parts_tracked string (truncate + hash to avoid long paths)."""
-    base = _safe_token.sub('-', text).strip('-') or "default"
-    max_len = 80
-    if len(base) <= max_len:
-        return base
-    digest = hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
-    return f"{base[:max_len - len(digest) - 1]}-{digest}"
+def _make_cb(**kw):
+    kw.setdefault("random_seed", SEED)
+    if USE_GPU:
+        kw.setdefault("task_type", "GPU")
+        kw.setdefault("devices", "0")
+    else:
+        kw.setdefault("task_type", "CPU")
+
+    return CatBoostClassifier(**kw)
 
 
 # %%
@@ -506,9 +510,6 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None,
             })
             for c in ('lab_id','video_id','agent_id','target_id','arena_shape'):
                 m[c] = m[c].astype('category')
-            # Align index to frame numbers so sampling with .loc on frame ids works.
-            # m = m.set_index('video_frame')
-            # m['video_frame'] = m.index
             return m
 
         # ---------- SINGLE ----------
@@ -587,16 +588,18 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None,
 def predict_multiclass_adaptive(pred, meta, action_thresholds=defaultdict(lambda: 0.27)):
     """Adaptive thresholding per action + temporal smoothing"""
     # Apply temporal smoothing
-    pred_smoothed = pred.rolling(window=7, min_periods=1, center=True).mean()
+    pred_smoothed = pred.rolling(window=5, min_periods=1, center=True).mean()
     
-    # Apply per-action thresholds first, then pick max among the valid ones
-    thresholds = np.array([action_thresholds.get(action, 0.27) for action in pred_smoothed.columns], dtype=np.float32)
-    vals = pred_smoothed.values
-    valid = vals >= thresholds  # broadcast per action
-    masked = np.where(valid, vals, -np.inf)
-    ama = masked.argmax(axis=1)
-    all_invalid = ~valid.any(axis=1)
-    ama[all_invalid] = -1
+    ama = np.argmax(pred_smoothed, axis=1)
+    
+    max_probs = pred_smoothed.max(axis=1)
+    threshold_mask = np.zeros(len(pred_smoothed), dtype=bool)
+    for i, action in enumerate(pred_smoothed.columns):
+        action_mask = (ama == i)
+        threshold = action_thresholds.get(action, 0.27)
+        threshold_mask |= (action_mask & (max_probs >= threshold))
+    
+    ama = np.where(threshold_mask, ama, -1)
     ama = pd.Series(ama, index=meta.video_frame)
     
     changes_mask = (ama != ama.shift(1)).values
@@ -795,6 +798,7 @@ def add_longrange_features(
 
     return X
 
+
 def add_cumulative_distance_single(X, cx, cy, fps, horizon_frames_base: int = 180, colname: str = "path_cum180"):
     L = max(1, _scale(horizon_frames_base, fps))  # frames
     # step length (cm per frame since coords are cm)
@@ -961,28 +965,14 @@ def transform_single(single_mouse, body_parts_tracked, fps):
 
     # Speed-like features via lagged displacements (duration-aware lag)
     if all(p in single_mouse.columns for p in ['ear_left', 'ear_right', 'tail_base']):
-        speed_lags = [1,2,3,4,5, 10, 20, 30,40,50,60]
-        speed_parts = []
-        for lag_base in speed_lags:
-            lag = _scale(lag_base, fps)
-            shifted = single_mouse[['ear_left', 'ear_right', 'tail_base']].shift(lag)
-            suf = f"l{lag_base}"
-            speed_parts.append(pd.DataFrame({
-                f'sp_lf_{suf}': np.square(single_mouse['ear_left'] - shifted['ear_left']).sum(axis=1, skipna=False),
-                f'sp_rt_{suf}': np.square(single_mouse['ear_right'] - shifted['ear_right']).sum(axis=1, skipna=False),
-                f'sp_lf2_{suf}': np.square(single_mouse['ear_left'] - shifted['tail_base']).sum(axis=1, skipna=False),
-                f'sp_rt2_{suf}': np.square(single_mouse['ear_right'] - shifted['tail_base']).sum(axis=1, skipna=False),
-            }))
-
-        speeds = pd.concat(speed_parts, axis=1)
-        # Keep original names for backward compatibility (based on 10-frame base lag)
-        if 'sp_lf_l10' in speeds:
-            speeds = speeds.assign(
-                sp_lf=speeds['sp_lf_l10'],
-                sp_rt=speeds['sp_rt_l10'],
-                sp_lf2=speeds['sp_lf2_l10'],
-                sp_rt2=speeds['sp_rt2_l10'],
-            )
+        lag = _scale(10, fps)
+        shifted = single_mouse[['ear_left', 'ear_right', 'tail_base']].shift(lag)
+        speeds = pd.DataFrame({
+            'sp_lf': np.square(single_mouse['ear_left'] - shifted['ear_left']).sum(axis=1, skipna=False),
+            'sp_rt': np.square(single_mouse['ear_right'] - shifted['ear_right']).sum(axis=1, skipna=False),
+            'sp_lf2': np.square(single_mouse['ear_left'] - shifted['tail_base']).sum(axis=1, skipna=False),
+            'sp_rt2': np.square(single_mouse['ear_right'] - shifted['tail_base']).sum(axis=1, skipna=False),
+        })
         X = pd.concat([X, speeds], axis=1)
 
     if 'nose+tail_base' in X.columns and 'ear_left+ear_right' in X.columns:
@@ -1062,27 +1052,18 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
 
     # Speed-like features via lagged displacements (duration-aware lag)
     if ('A', 'ear_left') in mouse_pair.columns and ('B', 'ear_left') in mouse_pair.columns:
-        speed_lags = [5, 10, 20, 30]
-        speed_parts = []
-        for lag_base in speed_lags:
-            lag = _scale(lag_base, fps)
-            shA = mouse_pair['A']['ear_left'].shift(lag)
-            shB = mouse_pair['B']['ear_left'].shift(lag)
-            suf = f"l{lag_base}"
-            speed_parts.append(pd.DataFrame({
-                f'sp_A_{suf}': np.square(mouse_pair['A']['ear_left'] - shA).sum(axis=1, skipna=False),
-                f'sp_AB_{suf}': np.square(mouse_pair['A']['ear_left'] - shB).sum(axis=1, skipna=False),
-                f'sp_B_{suf}': np.square(mouse_pair['B']['ear_left'] - shB).sum(axis=1, skipna=False),
-            }))
-
-        speeds = pd.concat(speed_parts, axis=1)
-        if 'sp_A_l10' in speeds:
-            speeds = speeds.assign(
-                sp_A=speeds['sp_A_l10'],
-                sp_AB=speeds['sp_AB_l10'],
-                sp_B=speeds['sp_B_l10'],
-            )
+        lag = _scale(10, fps)
+        shA = mouse_pair['A']['ear_left'].shift(lag)
+        shB = mouse_pair['B']['ear_left'].shift(lag)
+        speeds = pd.DataFrame({
+            'sp_A': np.square(mouse_pair['A']['ear_left'] - shA).sum(axis=1, skipna=False),
+            'sp_AB': np.square(mouse_pair['A']['ear_left'] - shB).sum(axis=1, skipna=False),
+            'sp_B': np.square(mouse_pair['B']['ear_left'] - shB).sum(axis=1, skipna=False),
+        })
         X = pd.concat([X, speeds], axis=1)
+
+    if 'nose+tail_base' in X.columns and 'ear_left+ear_right' in X.columns:
+        X['elong'] = X['nose+tail_base'] / (X['ear_left+ear_right'] + 1e-6)
 
     # Relative orientation
     if all(p in avail_A for p in ['nose', 'tail_base', 'body_center']) and all(p in avail_B for p in ['nose', 'tail_base', 'body_center']):
@@ -1090,14 +1071,6 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         dir_B = mouse_pair['B']['nose'] - mouse_pair['B']['tail_base']
         X['rel_ori'] = (dir_A['x'] * dir_B['x'] + dir_A['y'] * dir_B['y']) / (
             np.sqrt(dir_A['x']**2 + dir_A['y']**2) * np.sqrt(dir_B['x']**2 + dir_B['y']**2) + 1e-6)
-        # Head-to-head alignment (parallel vs antiparallel vs orthogonal)
-        head_dot = (dir_A['x'] * dir_B['x'] + dir_A['y'] * dir_B['y'])
-        head_den = (np.sqrt(dir_A['x']**2 + dir_A['y']**2) * np.sqrt(dir_B['x']**2 + dir_B['y']**2) + 1e-6)
-        head_cos = head_dot / head_den
-        X['head_cos'] = head_cos
-        X['head_parallel'] = (head_cos > 0.5).astype(float)
-        X['head_antipar'] = (head_cos < -0.5).astype(float)
-        X['head_side'] = ((head_cos >= -0.5) & (head_cos <= 0.5)).astype(float)
 
         def _ang(dx, dy):
             return np.arctan2(dy, dx)
@@ -1187,47 +1160,12 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
     if 'nose' in avail_A and 'nose' in avail_B:
         nn = np.sqrt((mouse_pair['A']['nose']['x'] - mouse_pair['B']['nose']['x'])**2 +
                      (mouse_pair['A']['nose']['y'] - mouse_pair['B']['nose']['y'])**2)
-        for lag in [1,2,3,4,5,6,7,8,9,10, 20, 30, 40, 50, 60, 70,80,90,100]:
+        for lag in [10, 20, 40]:
             l = _scale(lag, fps)
             X[f'nn_lg{lag}']  = nn.shift(l)
             X[f'nn_ch{lag}']  = nn - nn.shift(l)
             is_cl = (nn < 10.0).astype(float)
             X[f'cl_ps{lag}']  = is_cl.rolling(l, min_periods=1).mean()
-
-        # Nose approach vs lateral slip (cm/s; >0 means separating along radial line)
-        rel_x = mouse_pair['A']['nose']['x'] - mouse_pair['B']['nose']['x']
-        rel_y = mouse_pair['A']['nose']['y'] - mouse_pair['B']['nose']['y']
-        Avx = mouse_pair['A']['nose']['x'].diff()
-        Avy = mouse_pair['A']['nose']['y'].diff()
-        Bvx = mouse_pair['B']['nose']['x'].diff()
-        Bvy = mouse_pair['B']['nose']['y'].diff()
-        rel_den = (nn + 1e-6)
-        rv = ((Avx - Bvx) * rel_x + (Avy - Bvy) * rel_y) / rel_den
-        lv = ((Avx - Bvx) * (-rel_y) + (Avy - Bvy) * rel_x) / rel_den
-        X['nn_rad_sp'] = (rv * float(fps)).fillna(0)
-        X['nn_lat_sp'] = (lv * float(fps)).fillna(0)
-
-        # Nose speeds and imbalance (cm/s)
-        A_sp = np.sqrt(Avx**2 + Avy**2) * float(fps)
-        B_sp = np.sqrt(Bvx**2 + Bvy**2) * float(fps)
-        gap_sp = (A_sp - B_sp)
-        X['nose_spdA'] = A_sp
-        X['nose_spdB'] = B_sp
-        X['nose_spd_gap'] = gap_sp
-        for lag in [5, 10, 20, 30]:
-            l = _scale(lag, fps)
-            X[f'nose_spdA_lg{lag}'] = A_sp.shift(l)
-            X[f'nose_spdB_lg{lag}'] = B_sp.shift(l)
-            X[f'nose_spd_gap_lg{lag}'] = gap_sp.shift(l)
-
-        # Rolling proximity stats and multi-threshold contact ratios
-        roll_opts = dict(min_periods=1, center=True)
-        for w in [5, 15, 45]:
-            ws = _scale(w, fps)
-            X[f'nn_mean{w}'] = nn.rolling(ws, **roll_opts).mean()
-            X[f'nn_std{w}']  = nn.rolling(ws, **roll_opts).std()
-            for thr in (8.0, 12.0, 15.0):
-                X[f'nn_ct{int(thr)}_{w}'] = (nn < thr).rolling(ws, **roll_opts).mean()
 
     # Velocity alignment (duration-aware offsets)
     if 'body_center' in avail_A and 'body_center' in avail_B:
@@ -1237,7 +1175,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         Bvy = mouse_pair['B']['body_center']['y'].diff()
         val = (Avx * Bvx + Avy * Bvy) / (np.sqrt(Avx**2 + Avy**2) * np.sqrt(Bvx**2 + Bvy**2) + 1e-6)
 
-        for off in [-20, -10, 10, 20]:
+        for off in [-20, -10, 0, 10, 20]:
             o = _scale_signed(off, fps)
             X[f'va_{off}'] = val.shift(-o)
 
@@ -1253,44 +1191,24 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
 
 
 # %%
-
-def tune_threshold(oof_pred: np.ndarray, y_true: np.ndarray) -> float:
-    """Search the probability cutoff that maximizes F1."""
-    def objective(trial):
-        threshold = trial.suggest_float("threshold", 0.0, 1.0, step=0.01)
-        return f1_score(y_true, (oof_pred >= threshold), zero_division=0)
-
-    # Silence per-trial Optuna INFO logs; only report when we get a better score.
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    best_val = [-np.inf]
-
-    def _report_best(study, trial):
-        if trial.value is None:
-            return
-        if trial.value > best_val[0]:
-            best_val[0] = trial.value
-            if verbose:
-                print(f"  [tune] trial={trial.number} new best thr={trial.params['threshold']:.2f} f1={trial.value:.4f}")
-
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=200, n_jobs=-1, callbacks=[_report_best])
-    return float(study.best_params["threshold"])
+# helpers
+def _find_lgbm_step(pipe):
+    try:
+        if "stratifiedsubsetclassifier__estimator" in pipe.get_params():
+            est = pipe.get_params()["stratifiedsubsetclassifier__estimator"]
+            if isinstance(est, lightgbm.LGBMClassifier):
+                return "stratifiedsubsetclassifier"
+        if "stratifiedsubsetclassifierweval__estimator" in pipe.get_params():
+            est = pipe.get_params()["stratifiedsubsetclassifierweval__estimator"]
+            if isinstance(est, lightgbm.LGBMClassifier):
+                return "stratifiedsubsetclassifierweval"
+    except Exception as e:
+        print(e)
+    return None
 
 
 # %%
 def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples=1_500_000):
-    slug = _slugify(body_parts_tracked_str)
-    thr_dir = THRESHOLD_DIR
-    mdl_dir = MODEL_DIR
-    thr_load_dir = THRESHOLD_LOAD_DIR
-    mdl_load_dir = MODEL_LOAD_DIR
-    os.makedirs(thr_dir, exist_ok=True)
-    os.makedirs(mdl_dir, exist_ok=True)
-    thr_path = os.path.join(thr_dir, f"{slug}_{switch_tr}_thresholds.pkl")
-    mdl_path = os.path.join(mdl_dir, f"{slug}_{switch_tr}_models.pkl")
-    thr_load_path = os.path.join(thr_load_dir, f"{slug}_{switch_tr}_thresholds.pkl")
-    mdl_load_path = os.path.join(mdl_load_dir, f"{slug}_{switch_tr}_models.pkl")
-
     models = []
     xgb0 = _make_xgb(
         n_estimators=180, learning_rate=0.08, max_depth=6,
@@ -1339,134 +1257,37 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         ))
         model_names.extend(['xgb1', 'xgb2'])
 
-    action_thresholds = defaultdict(lambda: 0.27)
     model_list = []
+    for action in label.columns:
+        action_mask = ~label[action].isna().values
+        y_action = label[action][action_mask].values.astype(int)
+        meta_masked = meta.iloc[action_mask]
 
-    # ---------- thresholds ----------
-    if not USE_ADAPTIVE_THRESHOLDS:
-        if verbose:
-            print(f"[thr] using fixed threshold 0.27 | {switch_tr}")
-    elif LOAD_THRESHOLDS and os.path.exists(thr_load_path):
-        loaded_thr = joblib.load(thr_load_path)
-        action_thresholds.update(loaded_thr)
-        if verbose:
-            print(f"[thr] loaded thresholds from {thr_load_path}")
-    else:
-        for action in label.columns:
-            action_mask = ~label[action].isna().values
-            y_action = label[action][action_mask].values.astype(int)
-            meta_masked = meta.iloc[action_mask]
-            groups_action = meta_masked.video_id.values
-
-            tune_cap = n_samples
-            X_action = X_tr[action_mask]
-            X_tune = X_action
-            y_tune = y_action
-            groups_tune = groups_action
-            if len(y_tune) > tune_cap:
-                rng = np.random.default_rng(SEED)
-                keep_idx = rng.choice(len(y_tune), size=tune_cap, replace=False)
-                X_tune = X_action.iloc[keep_idx]
-                y_tune = y_action[keep_idx]
-                groups_tune = groups_action[keep_idx]
-
-            unique_groups = np.unique(groups_tune)
-            n_pos = int(y_tune.sum())
-            n_neg = int(len(y_tune) - n_pos)
-            if len(unique_groups) >= 2 and n_pos > 0 and n_neg > 0:
-                n_splits = min(5, len(unique_groups))
-                cv_raw = GroupKFold(n_splits=n_splits)
-                splits = list(cv_raw.split(np.zeros(len(y_tune), dtype=np.int8), y_tune, groups_tune))
-
-                single_class_fold = any(
-                    (np.unique(y_tune[tr_idx]).size < 2) or (np.unique(y_tune[te_idx]).size < 2)
-                    for tr_idx, te_idx in splits
-                )
-                if single_class_fold:
-                    if verbose:
-                        print(f"threshold tuning skipped (single-class fold) | {switch_tr} | action={action}")
-                else:
-                    base_model = clone(models[0])
-                    oof_pred = cross_val_predict(
-                        base_model,
-                        X_tune,
-                        y_tune,
-                        cv=splits,
-                        groups=groups_tune,
-                        method="predict_proba",
-                        n_jobs=1
-                    )[:, 1]
-                    tuned_thr = tune_threshold(oof_pred, y_tune)
-                    action_thresholds[action] = tuned_thr
-                    if verbose:
-                        print(f"tuned threshold {tuned_thr:.2f} | {switch_tr} | action={action} | groups={len(unique_groups)}")
-                    del base_model, oof_pred, splits
-                    gc.collect()
-            else:
-                if verbose:
-                    print(f"threshold tuning skipped (insufficient groups or classes) | {switch_tr} | action={action}")
-
-    try:
-        joblib.dump(dict(action_thresholds), thr_path)
-        if verbose:
-            print(f"saved thresholds -> {thr_path}")
-    except OSError as e:
-        if verbose:
-            print(f"[thr] save failed ({e}); skipping save.")
-
-    if ONLY_TUNE_THRESHOLDS:
-        if verbose:
-            print("[mode] ONLY_TUNE_THRESHOLDS=True, skipping training and inference.")
-        del X_tr; gc.collect()
-        return
-
-    # ---------- models ----------
-    if LOAD_MODELS and os.path.exists(mdl_load_path):
-        model_list = joblib.load(mdl_load_path)
-        if verbose:
-            print(f"[mdl] loaded models from {mdl_load_path}")
-        if CHECK_LOAD:
-            # Drop loaded actions that have no positives in current data
-            filtered = []
-            for action, trained in model_list:
-                action_mask = ~label[action].isna().values
-                y_action = label[action][action_mask].values.astype(int)
-                if y_action.sum() == 0:
-                    if verbose:
-                        print(f"[mdl] drop loaded action={action} (no positives in current data)")
-                    continue
-                filtered.append((action, trained))
-            model_list = filtered
-    else:
-        for action in label.columns:
-            action_mask = ~label[action].isna().values
-            y_action = label[action][action_mask].values.astype(int)
-            meta_masked = meta.iloc[action_mask]
-            groups_action = meta_masked.video_id.values
-            if y_action.sum() == 0:
-                if verbose:
-                    print(f"[mdl] skip action={action} (no positives)")
-                continue
-
-            trained = []
-            for model_idx, m in enumerate(models):
-                m_clone = clone(m)
+        trained = []
+        for model_idx, m in enumerate(models):
+            m_clone = clone(m)
+            try:
                 t0 = perf_counter()
                 m_clone.fit(X_tr[action_mask], y_action)
                 dt = perf_counter() - t0
                 print(f"trained model {model_names[model_idx]} | {switch_tr} | action={action} | {dt:.1f}s", flush=True)
-                trained.append(m_clone)
+            except Exception:
+                step = _find_lgbm_step(m_clone)
+                if step is None:
+                    continue
+                try:
+                    m_clone.set_params(**{f"{step}__estimator__device": "cpu"})
+                    t0 = perf_counter()
+                    m_clone.fit(X_tr[action_mask], y_action)
+                    dt = perf_counter() - t0
+                    print(f"trained (CPU fallback) {model_names[model_idx]} | {switch_tr} | action={action} | {dt:.1f}s", flush=True)
+                except Exception as e2:
+                    print(e2)
+                    continue
+            trained.append(m_clone)
 
-            if trained:
-                model_list.append((action, trained))
-
-        try:
-            joblib.dump(model_list, mdl_path)
-            if verbose:
-                print(f"saved models -> {mdl_path}")
-        except OSError as e:
-            if verbose:
-                print(f"[mdl] save failed ({e}); skipping save.")
+        if trained:
+            model_list.append((action, trained))
 
     del X_tr; gc.collect()
 
@@ -1489,6 +1310,8 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         assert switch_te == switch_tr
         try:
             fps_i = _fps_from_meta(meta_te, fps_lookup, default_fps=30.0)
+
+            # fallback to original tree-based inference if ST-GCN not used
             if switch_te == 'single':
                 X_te = transform_single(data_te, body_parts_tracked, fps_i)
             else:
@@ -1507,7 +1330,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             del X_te; gc.collect()
 
             if pred.shape[1] != 0:
-                submission_list.append(predict_multiclass_adaptive(pred, meta_te, action_thresholds))
+                submission_list.append(predict_multiclass_adaptive(pred, meta_te))
         except Exception as e:
             print(e)
             try: del data_te
@@ -1578,167 +1401,79 @@ submission_list = []
 
 for section in range(len(body_parts_tracked_list)):
     body_parts_tracked_str = body_parts_tracked_list[section]
-    # try:
-    body_parts_tracked = json.loads(body_parts_tracked_str)
-    print(f"{section}. Processing: {len(body_parts_tracked)} body parts")
-    if len(body_parts_tracked) > 5:
-        body_parts_tracked = [b for b in body_parts_tracked if b not in drop_body_parts]
+    try:
+        body_parts_tracked = json.loads(body_parts_tracked_str)
+        print(f"{section}. Processing: {len(body_parts_tracked)} body parts")
+        if len(body_parts_tracked) > 5:
+            body_parts_tracked = [b for b in body_parts_tracked if b not in drop_body_parts]
 
-    train_subset = train[train.body_parts_tracked == body_parts_tracked_str]
+        train_subset = train[train.body_parts_tracked == body_parts_tracked_str]
 
-    _fps_lookup = (
-        train_subset[['video_id', 'frames_per_second']]
-        .drop_duplicates('video_id')
-        .set_index('video_id')['frames_per_second']
-        .to_dict()
-    )
+        _fps_lookup = (
+            train_subset[['video_id', 'frames_per_second']]
+            .drop_duplicates('video_id')
+            .set_index('video_id')['frames_per_second']
+            .to_dict()
+        )
 
-    single_list, single_label_list, single_meta_list = [], [], []
-    pair_list, pair_label_list, pair_meta_list = [], [], []
+        single_list, single_label_list, single_meta_list = [], [], []
+        pair_list, pair_label_list, pair_meta_list = [], [], []
 
-    for switch, data, meta, label in generate_mouse_data(train_subset, 'train'):
-        if switch == 'single':
-            single_list.append(data)
-            single_meta_list.append(meta)
-            single_label_list.append(label)
-        else:
-            pair_list.append(data)
-            pair_meta_list.append(meta)
-            pair_label_list.append(label)
-
-    if len(single_list) > 0:
-        single_frame_counts = [len(meta) for meta in single_meta_list]
-        total_single_frames = sum(single_frame_counts)
-        single_needs_sampling = total_single_frames > N_CUT
-
-        single_feats_parts = []
-        for idx, (data_i, meta_i, label_i, frames_i) in enumerate(
-            zip(single_list, single_meta_list, single_label_list, single_frame_counts)
-        ):
-            fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
-            Xi_full = transform_single(data_i, body_parts_tracked, fps_i).astype(np.float32)
-
-            if single_needs_sampling and frames_i > 0:
-                sample_n = int(round(N_CUT * (frames_i / total_single_frames)))
-                sample_n = min(len(Xi_full), max(1, sample_n))
-                # Stratify on "any action active" to keep positive/negative balance
-                y_arr = (label_i.sum(axis=1) > 0).astype(int).values
-                if verbose:
-                    counts = np.bincount(y_arr, minlength=2)
-                    # print(f"[debug] single sampling | section={section} | frames={frames_i} | sample_n={sample_n} | counts={counts.tolist()}")
-                # Ensure minimum positive share in the sampled set
-                rng = np.random.default_rng(SEED)
-                pos_idx = np.where(y_arr == 1)[0]
-                neg_idx = np.where(y_arr == 0)[0]
-                n_pos = len(pos_idx); n_neg = len(neg_idx)
-                target_pos = min(n_pos, max(0, int(round(sample_n * LEAST_POS_PERC)))) if n_pos > 0 else 0
-                target_neg = sample_n - target_pos
-                if np.min(np.bincount(y_arr, minlength=2)) < 2 or sample_n >= len(y_arr):
-                    strat_idx = rng.choice(len(y_arr), size=sample_n, replace=False)
-                else:
-                    # draw positives first (up to target_pos), rest from negatives
-                    pos_keep = rng.choice(pos_idx, size=target_pos, replace=False) if target_pos > 0 else np.array([], dtype=int)
-                    neg_keep = rng.choice(neg_idx, size=min(target_neg, n_neg), replace=False)
-                    strat_idx = np.concatenate([pos_keep, neg_keep])
-                    if len(strat_idx) < sample_n:
-                        # top up with any remaining samples if needed
-                        remain = sample_n - len(strat_idx)
-                        pool = np.setdiff1d(np.arange(len(y_arr)), strat_idx, assume_unique=False)
-                        extra = rng.choice(pool, size=min(remain, len(pool)), replace=False)
-                        strat_idx = np.concatenate([strat_idx, extra])
-                    rng.shuffle(strat_idx)
-                Xi = Xi_full.iloc[strat_idx]
-                meta_i = meta_i.iloc[strat_idx]
-                label_i = label_i.iloc[strat_idx]
+        for switch, data, meta, label in generate_mouse_data(train_subset, 'train'):
+            if switch == 'single':
+                single_list.append(data)
+                single_meta_list.append(meta)
+                single_label_list.append(label)
             else:
-                Xi = Xi_full
+                pair_list.append(data)
+                pair_meta_list.append(meta)
+                pair_label_list.append(label)
 
-            # keep meta/label aligned with sampled features
-            single_meta_list[idx] = meta_i
-            single_label_list[idx] = label_i
-            single_feats_parts.append(Xi)
-            del Xi
+        if len(single_list) > 0:
+            single_feats_parts = []
+            for data_i, meta_i in zip(single_list, single_meta_list):
+                fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
+                Xi = transform_single(data_i, body_parts_tracked, fps_i).astype(np.float32)
+                single_feats_parts.append(Xi)
 
-        X_tr = pd.concat(single_feats_parts, axis=0, ignore_index=True)
+            X_tr = pd.concat(single_feats_parts, axis=0, ignore_index=True)
+ 
+            single_label = pd.concat(single_label_list, axis=0, ignore_index=True)
+            single_meta  = pd.concat(single_meta_list,  axis=0, ignore_index=True)
 
-        single_label = pd.concat(single_label_list, axis=0, ignore_index=True)
-        single_meta  = pd.concat(single_meta_list,  axis=0, ignore_index=True)
+            del single_list, single_label_list, single_meta_list, single_feats_parts
+            gc.collect()
 
-        del single_list, single_label_list, single_meta_list, single_feats_parts
-        gc.collect()
+            print(f"  Single: {X_tr.shape}")
+            submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta)
 
-        print(f"  Single: {X_tr.shape}")
-        submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta)
+            del X_tr, single_label, single_meta
+            gc.collect()
 
-        del X_tr, single_label, single_meta
-        gc.collect()
+        if len(pair_list) > 0:
+            pair_feats_parts = []
+            for data_i, meta_i in zip(pair_list, pair_meta_list):
+                fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
+                Xi = transform_pair(data_i, body_parts_tracked, fps_i).astype(np.float32)
+                pair_feats_parts.append(Xi)
 
-    if len(pair_list) > 0:
-        pair_frame_counts = [len(meta) for meta in pair_meta_list]
-        total_pair_frames = sum(pair_frame_counts)
-        pair_needs_sampling = total_pair_frames > N_CUT
+            X_tr = pd.concat(pair_feats_parts, axis=0, ignore_index=True)
 
-        pair_feats_parts = []
-        for idx, (data_i, meta_i, label_i, frames_i) in enumerate(
-            zip(pair_list, pair_meta_list, pair_label_list, pair_frame_counts)
-        ):
-            fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
-            Xi_full = transform_pair(data_i, body_parts_tracked, fps_i).astype(np.float32)
+            
+            pair_label = pd.concat(pair_label_list, axis=0, ignore_index=True)
+            pair_meta  = pd.concat(pair_meta_list,  axis=0, ignore_index=True)
 
-            if pair_needs_sampling and frames_i > 0:
-                sample_n = int(round(N_CUT * (frames_i / total_pair_frames)))
-                sample_n = min(len(Xi_full), max(1, sample_n))
-                # Stratify on "any action active" to keep positive/negative balance
-                y_arr = (label_i.sum(axis=1) > 0).astype(int).values
-                if verbose:
-                    counts = np.bincount(y_arr, minlength=2)
-                    # print(f"[debug] pair sampling | section={section} | frames={frames_i} | sample_n={sample_n} | counts={counts.tolist()}")
-                rng = np.random.default_rng(SEED)
-                pos_idx = np.where(y_arr == 1)[0]
-                neg_idx = np.where(y_arr == 0)[0]
-                n_pos = len(pos_idx); n_neg = len(neg_idx)
-                target_pos = min(n_pos, max(0, int(round(sample_n * LEAST_POS_PERC)))) if n_pos > 0 else 0
-                target_neg = sample_n - target_pos
-                if np.min(np.bincount(y_arr, minlength=2)) < 2 or sample_n >= len(y_arr):
-                    strat_idx = rng.choice(len(y_arr), size=sample_n, replace=False)
-                else:
-                    pos_keep = rng.choice(pos_idx, size=target_pos, replace=False) if target_pos > 0 else np.array([], dtype=int)
-                    neg_keep = rng.choice(neg_idx, size=min(target_neg, n_neg), replace=False)
-                    strat_idx = np.concatenate([pos_keep, neg_keep])
-                    if len(strat_idx) < sample_n:
-                        remain = sample_n - len(strat_idx)
-                        pool = np.setdiff1d(np.arange(len(y_arr)), strat_idx, assume_unique=False)
-                        extra = rng.choice(pool, size=min(remain, len(pool)), replace=False)
-                        strat_idx = np.concatenate([strat_idx, extra])
-                    rng.shuffle(strat_idx)
-                Xi = Xi_full.iloc[strat_idx]
-                meta_i = meta_i.iloc[strat_idx]
-                label_i = label_i.iloc[strat_idx]
-            else:
-                Xi = Xi_full
+            del pair_list, pair_label_list, pair_meta_list, pair_feats_parts
+            gc.collect()
 
-            pair_meta_list[idx] = meta_i
-            pair_label_list[idx] = label_i
-            pair_feats_parts.append(Xi)
-            del Xi
+            print(f"  Pair: {X_tr.shape}")
+            submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta)
 
-        X_tr = pd.concat(pair_feats_parts, axis=0, ignore_index=True)
+            del X_tr, pair_label, pair_meta
+            gc.collect()
 
-        
-        pair_label = pd.concat(pair_label_list, axis=0, ignore_index=True)
-        pair_meta  = pd.concat(pair_meta_list,  axis=0, ignore_index=True)
-
-        del pair_list, pair_label_list, pair_meta_list, pair_feats_parts
-        gc.collect()
-
-        print(f"  Pair: {X_tr.shape}")
-        submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta)
-
-        del X_tr, pair_label, pair_meta
-        gc.collect()
-
-    # except Exception as e:
-    #     print(f'***Exception*** {str(e)}')
+    except Exception as e:
+        print(f'***Exception*** {str(e)[:100]}')
 
     gc.collect()
     print()
@@ -1759,3 +1494,6 @@ submission_robust = robustify(submission, test, 'test')
 submission_robust.index.name = 'row_id'
 submission_robust.to_csv('submission.csv')
 print(f"\nSubmission created: {len(submission_robust)} predictions")
+
+
+

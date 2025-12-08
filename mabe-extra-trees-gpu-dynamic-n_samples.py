@@ -1248,7 +1248,6 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
 
 
 # %%
-# helpers
 def _find_lgbm_step(pipe):
     try:
         if "stratifiedsubsetclassifier__estimator" in pipe.get_params():
@@ -1263,9 +1262,39 @@ def _find_lgbm_step(pipe):
         print(e)
     return None
 
+def _compute_dynamic_n_samples(X: pd.DataFrame, requested: Optional[int] = None, budget: int = 1_500_000 * 200) -> int:
+    """
+    Pick the largest n_samples such that n_samples * n_features <= budget.
+    Falls back to the available row count if that is smaller; respects an optional requested cap.
+    """
+    n_rows = len(X)
+    if n_rows == 0:
+        return 0
+
+    n_features = max(1, X.shape[1])
+    max_by_budget = budget // n_features
+    if max_by_budget <= 0:
+        return 0
+
+    n_samples = min(n_rows, max_by_budget)
+    if requested is not None:
+        try:
+            n_samples = min(n_samples, int(requested))
+        except Exception:
+            pass
+
+    return int(n_samples)
+
+
 
 # %%
-def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples=1_500_000):
+def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples=None):
+    auto_n_samples = _compute_dynamic_n_samples(X_tr, requested=n_samples)
+    if auto_n_samples <= 0:
+        print(f"skip training {switch_tr}: no samples available within budget (features={X_tr.shape[1]})")
+        return
+    print(f"  Using n_samples={auto_n_samples} (features={X_tr.shape[1]})")
+
     models = []
     xgb0 = _make_xgb(
         n_estimators=180, learning_rate=0.08, max_depth=6,
@@ -1273,7 +1302,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         subsample=0.8, colsample_bytree=0.8, single_precision_histogram=USE_GPU,
         verbosity=0
     )
-    models.append(make_pipeline(StratifiedSubsetClassifier(xgb0, n_samples and int(n_samples/1.2))))
+    models.append(make_pipeline(StratifiedSubsetClassifier(xgb0, auto_n_samples)))
 
     xgb_250 = _make_xgb(
         n_estimators=250, learning_rate=0.08, max_depth=6,
@@ -1281,7 +1310,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         subsample=0.8, colsample_bytree=0.8, single_precision_histogram=USE_GPU,
         verbosity=0
     )
-    models.append(make_pipeline(StratifiedSubsetClassifier(xgb_250, n_samples and int(n_samples/1.2))))
+    models.append(make_pipeline(StratifiedSubsetClassifier(xgb_250, auto_n_samples)))
 
     model_names = ['xgb_180','xgb_250']
 
@@ -1296,7 +1325,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             single_precision_histogram=True, verbosity=0
         )
         models.append(make_pipeline(
-            StratifiedSubsetClassifierWEval(xgb1, n_samples and int(n_samples/2.),
+            StratifiedSubsetClassifierWEval(xgb1, auto_n_samples,
                                             random_state=SEED, valid_size=0.10, val_cap_ratio=0.25,
                                             es_rounds="auto", es_metric="auto")
         ))
@@ -1308,7 +1337,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             single_precision_histogram=True, verbosity=0
         )
         models.append(make_pipeline(
-            StratifiedSubsetClassifierWEval(xgb2, n_samples and int(n_samples/1.5),
+            StratifiedSubsetClassifierWEval(xgb2, auto_n_samples,
                                             random_state=SEED, valid_size=0.10, val_cap_ratio=0.25,
                                             es_rounds="auto", es_metric="auto")
         ))
