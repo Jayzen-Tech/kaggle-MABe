@@ -122,13 +122,6 @@ class StratifiedSubsetClassifierWEval(ClassifierMixin, BaseEstimator):
             self.estimator.set_params(scale_pos_weight=(n_neg / n_pos))
             self.estimator.set_params(eval_metric=metric)
 
-        elif self._is_catboost(self.estimator):
-            # GPU-safe auto balancing
-            try: self.estimator.set_params(auto_class_weights="Balanced")
-            except Exception: pass
-            try: self.estimator.set_params(eval_metric=metric)
-            except Exception: pass
-
         # Fit with ES if we have any validation (single-class OK with Logloss)
         has_valid = (Xva is not None and len(yva) > 0)
         if has_valid and self._is_xgb(self.estimator):
@@ -143,20 +136,6 @@ class StratifiedSubsetClassifierWEval(ClassifierMixin, BaseEstimator):
                     data_name="validation_0",
                     save_best=True
                 )]
-            )
-        elif has_valid and self._is_catboost(self.estimator):
-            from catboost import Pool
-            self.estimator.set_params(
-                use_best_model=True,
-                od_type="Iter",
-                od_wait=int(patience),
-                custom_metric=["PRAUC:type=Classic;hints=skip_train~true"],
-            )
-            self.estimator.fit(
-                Xtr, ytr,
-                eval_set=Pool(Xva, yva),
-                verbose=False,
-                metric_period=50
             )
         else:
             # Fall back: train on train split without ES
