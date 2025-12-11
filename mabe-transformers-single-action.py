@@ -8,7 +8,8 @@ import re
 import itertools
 import random
 import time
-from collections import deque
+import hashlib
+from collections import defaultdict, deque
 from typing import List, Tuple
 
 import numpy as np
@@ -62,6 +63,39 @@ def _env_optional_int(name):
     except ValueError:
         return None
 
+def _slugify(text: str):
+    cleaned = re.sub(r'[^0-9a-zA-Z]+', '-', str(text).strip()).strip('-').lower()
+    if not cleaned:
+        return 'default'
+    max_len = 80
+    if len(cleaned) <= max_len:
+        return cleaned
+    digest = hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
+    return f"{cleaned[:max_len - len(digest) - 1]}-{digest}"
+
+
+def _ensure_dir(path: str):
+    if not path:
+        return
+    os.makedirs(path, exist_ok=True)
+
+
+def _load_threshold_file(path: str):
+    with open(path, 'r') as f:
+        data = json.load(f)
+    return {str(k): float(v) for k, v in data.items()}
+
+
+def _save_threshold_file(path: str, thresholds: dict):
+    if not thresholds:
+        return
+    _ensure_dir(os.path.dirname(path))
+    with open(path, 'w') as f:
+        json.dump({k: float(v) for k, v in thresholds.items()}, f)
+
+
+USE_ADAPTIVE_THRESHOLDS = True
+
 
 # GPU utilization controls (override defaults with environment variables like
 # MABE_TRAIN_BATCH_SIZE, MABE_PRED_BATCH_SIZE, MABE_NUM_WORKERS, MABE_PIN_MEMORY,
@@ -110,7 +144,6 @@ MIN_TRAIN_SAMPLES = 512
 THRESHOLD_DEFAULT = 0.35
 WINDOW_SMOOTHING = 7
 TRAIN_N_SAMPLES = _env_optional_int('MABE_TRAIN_N_SAMPLES')
-NONE_CLASS = "__none__"
 
 if verbose:
     print(
@@ -312,6 +345,64 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None,
                         yield 'pair', pair_xy, meta_df, actions
 
 # %%
+def predict_multiclass_adaptive(pred, meta, action_thresholds=defaultdict(lambda: THRESHOLD_DEFAULT)):
+    if 'video_frame' not in meta.columns:
+        if meta.index.name == 'video_frame':
+            meta = meta.reset_index().rename(columns={'index': 'video_frame'})
+        elif 'index' in meta.columns:
+            meta = meta.rename(columns={'index': 'video_frame'})
+        else:
+            meta = meta.copy()
+            meta['video_frame'] = meta.index.to_numpy()
+
+    pred_smoothed = pred.rolling(window=WINDOW_SMOOTHING, min_periods=1, center=True).mean()
+    thresholds = np.array([action_thresholds.get(action, THRESHOLD_DEFAULT) for action in pred_smoothed.columns], dtype=np.float32)
+    vals = pred_smoothed.values
+    valid = vals >= thresholds
+    masked = np.where(valid, vals, -np.inf)
+    ama = masked.argmax(axis=1)
+    all_invalid = ~valid.any(axis=1)
+    ama[all_invalid] = -1
+    ama = pd.Series(ama, index=meta['video_frame'].values)
+
+    changes_mask = (ama != ama.shift(1)).values
+    ama_changes = ama[changes_mask]
+    meta_changes = meta[changes_mask]
+    mask = ama_changes.values >= 0
+    if len(mask) == 0:
+        return pd.DataFrame(columns=['video_id','agent_id','target_id','action','start_frame','stop_frame'])
+    mask[-1] = False
+
+    submission_part = pd.DataFrame({
+        'video_id': meta_changes['video_id'][mask].values,
+        'agent_id': meta_changes['agent_id'][mask].values,
+        'target_id': meta_changes['target_id'][mask].values,
+        'action': pred.columns[ama_changes[mask].values],
+        'start_frame': ama_changes.index[mask],
+        'stop_frame': ama_changes.index[1:][mask[:-1]]
+    })
+
+    stop_video_id = meta_changes['video_id'][1:][mask[:-1]].values if len(mask) > 1 else []
+    stop_agent_id = meta_changes['agent_id'][1:][mask[:-1]].values if len(mask) > 1 else []
+    stop_target_id = meta_changes['target_id'][1:][mask[:-1]].values if len(mask) > 1 else []
+
+    for i in range(len(submission_part)):
+        video_id = submission_part.video_id.iloc[i]
+        agent_id = submission_part.agent_id.iloc[i]
+        target_id = submission_part.target_id.iloc[i]
+        if i < len(stop_video_id):
+            if stop_video_id[i] != video_id or stop_agent_id[i] != agent_id or stop_target_id[i] != target_id:
+                new_stop_frame = meta.query("(video_id == @video_id)").video_frame.max() + 1
+                submission_part.iat[i, submission_part.columns.get_loc('stop_frame')] = new_stop_frame
+        else:
+            new_stop_frame = meta.query("(video_id == @video_id)").video_frame.max() + 1
+            submission_part.iat[i, submission_part.columns.get_loc('stop_frame')] = new_stop_frame
+
+    duration = submission_part.stop_frame - submission_part.start_frame
+    submission_part = submission_part[duration >= 3].reset_index(drop=True)
+    return submission_part
+
+# %%
 def robustify(submission, dataset, traintest, traintest_directory=None):
     if traintest_directory is None:
         traintest_directory = f"/kaggle/input/MABe-mouse-behavior-detection/{traintest}_tracking"
@@ -479,10 +570,7 @@ def _build_groups(X_df: pd.DataFrame, y_df: pd.DataFrame, meta_df: pd.DataFrame)
         order = np.argsort(frames, kind='stable')
         idx = idx[order]
         X_arr = X_df.iloc[idx].to_numpy(np.float32, copy=True)
-        y_arr = y_df.iloc[idx].to_numpy(copy=True)
-        if y_arr.ndim > 1:
-            y_arr = y_arr.reshape(-1)
-        y_arr = y_arr.astype(np.int64, copy=False)
+        y_arr = y_df.iloc[idx].to_numpy(np.float32, copy=True)
         meta_part = meta_df.iloc[idx].reset_index(drop=True)
         if len(X_arr) == 0:
             continue
@@ -527,8 +615,7 @@ class SlidingWindowDataset(Dataset):
         if len(window) < self.seq_len:
             pad = np.repeat(window[:1], self.seq_len - len(window), axis=0)
             window = np.concatenate([pad, window], axis=0)
-        target = int(yg[t])
-        return torch.from_numpy(window), torch.tensor(target, dtype=torch.long)
+        return torch.from_numpy(window), torch.from_numpy(yg[t])
 
 
 class PositionalEncoding(nn.Module):
@@ -577,7 +664,46 @@ def _micro_f1(tp: float, fp: float, fn: float) -> float:
     return (2 * tp) / denom
 
 
-def _train_transformer(groups: List[dict], input_dim: int, n_outputs: int, class_names: List[str]):
+def _grid_search_threshold(pred: np.ndarray, target: np.ndarray) -> float:
+    uniq = np.unique(target)
+    if uniq.size < 2:
+        return THRESHOLD_DEFAULT
+    best_thr = THRESHOLD_DEFAULT
+    best_f1 = -1.0
+    for thr in np.linspace(0.0, 1.0, 101):
+        preds = pred >= thr
+        tp = np.logical_and(preds, target).sum()
+        fp = np.logical_and(preds, ~target).sum()
+        fn = np.logical_and(~preds, target).sum()
+        denom = (2 * tp) + fp + fn
+        f1 = 0.0 if denom == 0 else (2 * tp) / denom
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr)
+    return best_thr
+
+
+def _tune_action_thresholds(prob: np.ndarray, target: np.ndarray, actions: List[str]) -> dict:
+    tuned = {}
+    bool_target = target >= 0.5
+    for idx, action in enumerate(actions):
+        thr = _grid_search_threshold(prob[:, idx], bool_target[:, idx])
+        tuned[action] = thr
+        if verbose:
+            action_idx = np.nonzero(~np.isnan(target[:, idx]))[0]
+            if len(action_idx) > 0:
+                preds = prob[action_idx, idx] >= thr
+                target_bin = bool_target[action_idx, idx]
+                tp = np.logical_and(preds, target_bin).sum()
+                fp = np.logical_and(preds, ~target_bin).sum()
+                fn = np.logical_and(~preds, target_bin).sum()
+                denom = (2 * tp) + fp + fn
+                f1 = 0.0 if denom == 0 else (2 * tp) / denom
+                print(f"  [thr] action={action} threshold={thr:.2f} f1={f1:.4f}")
+    return tuned
+
+
+def _train_transformer(groups: List[dict], input_dim: int, action_name: str):
     stride = _select_stride(groups, TRAIN_STRIDE, TRAIN_N_SAMPLES)
     dataset = SlidingWindowDataset(groups, seq_len=SEQ_LEN, stride=stride)
     if len(dataset) < MIN_TRAIN_SAMPLES:
@@ -607,7 +733,7 @@ def _train_transformer(groups: List[dict], input_dim: int, n_outputs: int, class
     val_loader = (DataLoader(dataset, **_loader_kwargs(TRAIN_BATCH_SIZE, SubsetRandomSampler(val_idx)))
                   if len(val_idx) > 0 else None)
 
-    model = TransformerClassifier(input_dim, n_outputs).to(device)
+    model = TransformerClassifier(input_dim, 1).to(device)
     if USE_TORCH_COMPILE:
         try:
             if verbose:
@@ -617,21 +743,18 @@ def _train_transformer(groups: List[dict], input_dim: int, n_outputs: int, class
             if verbose:
                 print(f"  torch.compile unavailable ({exc}); continuing without it")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss()
 
     best_state = None
     best_val = float('inf')
-    tuned_thresholds = {}
+    tuned_threshold = THRESHOLD_DEFAULT
     epoch_times = deque(maxlen=5)
     for epoch in range(EPOCHS):
         epoch_start = time.time()
         model.train()
         total_loss = 0.0
         total_count = 0
-        train_correct = 0.0
-        train_tp = {c: 0 for c in range(n_outputs)}
-        train_fp = {c: 0 for c in range(n_outputs)}
-        train_fn = {c: 0 for c in range(n_outputs)}
+        train_tp = train_fp = train_fn = 0.0
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
@@ -641,79 +764,57 @@ def _train_transformer(groups: List[dict], input_dim: int, n_outputs: int, class
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            # accumulate micro-F1 counts on-the-fly
             with torch.no_grad():
-                preds = torch.argmax(logits, dim=1)
-                train_correct += (preds == yb).sum().item()
-                for cls in range(n_outputs):
-                    cls_pred = preds == cls
-                    cls_true = yb == cls
-                    train_tp[cls] += torch.logical_and(cls_pred, cls_true).sum().item()
-                    train_fp[cls] += torch.logical_and(cls_pred, ~cls_true).sum().item()
-                    train_fn[cls] += torch.logical_and(~cls_pred, cls_true).sum().item()
+                prob = torch.sigmoid(logits)
+                preds = prob >= THRESHOLD_DEFAULT
+                target = yb >= 0.5
+                train_tp += torch.logical_and(preds, target).sum().item()
+                train_fp += torch.logical_and(preds, ~target).sum().item()
+                train_fn += torch.logical_and(~preds, target).sum().item()
             total_loss += loss.item() * len(xb)
             total_count += len(xb)
         avg_loss = total_loss / max(1, total_count)
-        train_acc = train_correct / max(1, total_count)
-        train_f1 = []
-        for cls in range(n_outputs):
-            tp = train_tp[cls]
-            fp = train_fp[cls]
-            fn = train_fn[cls]
-            denom = (2 * tp) + fp + fn
-            f1 = 0.0 if denom == 0 else (2 * tp) / denom
-            train_f1.append(f1)
+        train_f1 = _micro_f1(train_tp, train_fp, train_fn)
 
         if val_loader is not None:
             model.eval()
             val_loss = 0.0
             val_count = 0
-            val_correct = 0.0
-            val_tp = {c: 0 for c in range(n_outputs)}
-            val_fp = {c: 0 for c in range(n_outputs)}
-            val_fn = {c: 0 for c in range(n_outputs)}
+            val_tp = val_fp = val_fn = 0.0
+            val_probs_collect = []
+            val_targets_collect = []
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb = xb.to(device)
                     yb = yb.to(device)
                     logits = model(xb)
                     loss = criterion(logits, yb)
-                    preds = torch.argmax(logits, dim=1)
-                    val_correct += (preds == yb).sum().item()
-                    for cls in range(n_outputs):
-                        cls_pred = preds == cls
-                        cls_true = yb == cls
-                        val_tp[cls] += torch.logical_and(cls_pred, cls_true).sum().item()
-                        val_fp[cls] += torch.logical_and(cls_pred, ~cls_true).sum().item()
-                        val_fn[cls] += torch.logical_and(~cls_pred, cls_true).sum().item()
+                    prob = torch.sigmoid(logits)
+                    preds = prob >= THRESHOLD_DEFAULT
+                    target = yb >= 0.5
+                    val_tp += torch.logical_and(preds, target).sum().item()
+                    val_fp += torch.logical_and(preds, ~target).sum().item()
+                    val_fn += torch.logical_and(~preds, target).sum().item()
                     val_loss += loss.item() * len(xb)
                     val_count += len(xb)
+                    val_probs_collect.append(prob.cpu().numpy())
+                    val_targets_collect.append(yb.cpu().numpy())
             val_loss = val_loss / max(1, val_count)
-            val_acc = val_correct / max(1, val_count)
-            val_f1 = []
-            for cls in range(n_outputs):
-                tp = val_tp[cls]
-                fp = val_fp[cls]
-                fn = val_fn[cls]
-                denom = (2 * tp) + fp + fn
-                f1 = 0.0 if denom == 0 else (2 * tp) / denom
-                val_f1.append(f1)
+            val_f1 = _micro_f1(val_tp, val_fp, val_fn)
         else:
             val_loss = avg_loss
-            val_acc = train_acc
+            val_f1 = train_f1
 
         if verbose:
             epoch_elapsed = time.time() - epoch_start
             epoch_times.append(epoch_elapsed)
             remaining = (sum(epoch_times) / max(1, len(epoch_times))) * (EPOCHS - epoch - 1)
             eta_str = time.strftime("%H:%M:%S", time.gmtime(remaining))
-            def _fmt_f1(f1_list):
-                return ', '.join(f"{class_names[i]}={f1:.3f}" for i, f1 in enumerate(f1_list))
             print(
                 f"    epoch {epoch+1}/{EPOCHS} | "
-                f"train_loss={avg_loss:.4f} | train_acc={train_acc:.4f} | "
-                f"train_f1=[{_fmt_f1(train_f1)}] | "
-                f"val_loss={val_loss:.4f} | val_acc={val_acc:.4f} | "
-                f"val_f1=[{_fmt_f1(val_f1 if val_loader is not None else train_f1)}] | ETA {eta_str}"
+                f"train_loss={avg_loss:.4f} | train_f1={train_f1:.4f} | "
+                f"val_loss={val_loss:.4f} | val_f1={val_f1:.4f} | ETA {eta_str}"
             )
 
         if val_loss < best_val:
@@ -722,7 +823,13 @@ def _train_transformer(groups: List[dict], input_dim: int, n_outputs: int, class
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    return model
+    if val_loader is not None and val_probs_collect:
+        val_probs = np.concatenate(val_probs_collect, axis=0)[:, 0]
+        val_targets = np.concatenate(val_targets_collect, axis=0)[:, 0]
+        tuned_threshold = _grid_search_threshold(val_probs, val_targets >= 0.5)
+        if verbose:
+            print(f"  [thr] action={action_name} threshold={tuned_threshold:.2f}")
+    return model, tuned_threshold
 
 
 def _align_feature_meta(X_df: pd.DataFrame, meta_df: pd.DataFrame):
@@ -771,63 +878,6 @@ def _predict_video(model, X_df, meta_df, feature_cols, mean, std, actions):
     return pred_df, meta_sorted
 
 
-def predict_multiclass_softmax(pred, meta, none_label=NONE_CLASS):
-    if pred.empty:
-        return pd.DataFrame(columns=['video_id','agent_id','target_id','action','start_frame','stop_frame'])
-    if 'video_frame' not in meta.columns:
-        if meta.index.name == 'video_frame':
-            meta = meta.reset_index().rename(columns={'index': 'video_frame'})
-        elif 'index' in meta.columns:
-            meta = meta.rename(columns={'index': 'video_frame'})
-        else:
-            meta = meta.copy()
-            meta['video_frame'] = meta.index.to_numpy()
-    pred_smoothed = pred.rolling(window=WINDOW_SMOOTHING, min_periods=1, center=True).mean()
-    classes = [c for c in pred_smoothed.columns if c != none_label]
-    label_to_id = {c: i for i, c in enumerate(classes)}
-    vals = pred_smoothed.values
-    chosen_idx = np.argmax(vals, axis=1)
-    chosen_labels = pred_smoothed.columns.to_numpy()[chosen_idx]
-    ama_ids = np.full(len(chosen_labels), -1, dtype=np.int32)
-    for i, label in enumerate(chosen_labels):
-        ama_ids[i] = label_to_id.get(label, -1)
-    ama = pd.Series(ama_ids, index=meta['video_frame'])
-    changes_mask = (ama != ama.shift(1)).values
-    ama_changes = ama[changes_mask]
-    meta_changes = meta[changes_mask]
-    if len(ama_changes) == 0:
-        return pd.DataFrame(columns=['video_id','agent_id','target_id','action','start_frame','stop_frame'])
-    mask = ama_changes.values >= 0
-    if len(mask) == 0 or not mask.any():
-        return pd.DataFrame(columns=['video_id','agent_id','target_id','action','start_frame','stop_frame'])
-    mask[-1] = False
-    submission_part = pd.DataFrame({
-        'video_id': meta_changes['video_id'][mask].values,
-        'agent_id': meta_changes['agent_id'][mask].values,
-        'target_id': meta_changes['target_id'][mask].values,
-        'action': [classes[idx] for idx in ama_changes[mask].values],
-        'start_frame': ama_changes.index[mask],
-        'stop_frame': ama_changes.index[1:][mask[:-1]]
-    })
-    stop_video = meta_changes['video_id'][1:][mask[:-1]].values if len(mask) > 1 else []
-    stop_agent = meta_changes['agent_id'][1:][mask[:-1]].values if len(mask) > 1 else []
-    stop_target = meta_changes['target_id'][1:][mask[:-1]].values if len(mask) > 1 else []
-    for i in range(len(submission_part)):
-        video_id = submission_part.video_id.iloc[i]
-        agent_id = submission_part.agent_id.iloc[i]
-        target_id = submission_part.target_id.iloc[i]
-        if i < len(stop_video):
-            if stop_video[i] != video_id or stop_agent[i] != agent_id or stop_target[i] != target_id:
-                new_stop_frame = meta.query("(video_id == @video_id)").video_frame.max() + 1
-                submission_part.iat[i, submission_part.columns.get_loc('stop_frame')] = new_stop_frame
-        else:
-            new_stop_frame = meta.query("(video_id == @video_id)").video_frame.max() + 1
-            submission_part.iat[i, submission_part.columns.get_loc('stop_frame')] = new_stop_frame
-    duration = submission_part.stop_frame - submission_part.start_frame
-    submission_part = submission_part[duration >= 3].reset_index(drop=True)
-    return submission_part
-
-
 def run_transformer_pipeline(body_parts_tracked_str, switch, X_df, label_df, meta_df, test_subset, body_parts, submission_list):
     if len(X_df) == 0:
         return
@@ -840,35 +890,34 @@ def run_transformer_pipeline(body_parts_tracked_str, switch, X_df, label_df, met
         return
     label_df = label_df[actions].astype('float32')
     template_key = (switch, body_parts_tracked_str)
-    class_names = actions + [NONE_CLASS]
-    none_idx = len(actions)
-    if actions:
-        label_array = label_df.to_numpy(dtype=np.float32, copy=True)
-        best_idx = np.argmax(label_array, axis=1)
-        best_val = label_array[np.arange(len(label_array)), best_idx]
-        class_ids = np.where(best_val > 0.5, best_idx, none_idx)
-    else:
-        class_ids = np.full(len(label_df), none_idx, dtype=np.int64)
-    labels_multiclass = pd.DataFrame({'action_id': class_ids}, index=label_df.index)
     X_df = _ensure_template(template_key, X_df).astype('float32')
     mean, std = _compute_scaler(X_df)
     X_norm = _normalize_features(X_df, X_df.columns.tolist(), mean, std)
-    groups = _build_groups(X_norm, labels_multiclass, meta_df)
+    groups = _build_groups(X_norm, label_df, meta_df)
     if not groups:
         if verbose:
             print(f"  Skipping {switch} | {body_parts_tracked_str} (no training groups)")
         return
-    if verbose:
-        print(f"  Training transformer on {len(groups)} groups ({len(X_norm)} frames)")
-    model = _train_transformer(
-        groups,
-        input_dim=X_norm.shape[1],
-        n_outputs=len(class_names),
-        class_names=class_names
-    )
-    if model is None:
+    action_models = {}
+    action_thresholds = {}
+    for action in actions:
+        action_labels = label_df[[action]]
+        action_groups = _build_groups(X_norm, action_labels, meta_df)
+        if not action_groups:
+            if verbose:
+                print(f"  Skipping action {action} (no training groups)")
+            continue
+        if verbose:
+            print(f"  Training transformer for action={action} on {len(action_groups)} groups")
+        model, thr = _train_transformer(action_groups, input_dim=X_norm.shape[1], action_name=action)
+        if model is None:
+            continue
+        model.eval()
+        action_models[action] = model
+        action_thresholds[action] = thr if USE_ADAPTIVE_THRESHOLDS else THRESHOLD_DEFAULT
+    if not action_models:
         return
-    model.eval()
+    action_thresholds = defaultdict(lambda: THRESHOLD_DEFAULT, action_thresholds)
 
     generator = generate_mouse_data(
         test_subset, 'test',
@@ -882,20 +931,22 @@ def run_transformer_pipeline(body_parts_tracked_str, switch, X_df, label_df, met
         else:
             feat = _extract_pair_features(data_te, body_parts)
         feat = _ensure_template(template_key, feat)
-        pred_df, meta_sorted = _predict_video(model, feat, meta_te, X_df.columns.tolist(), mean, std, class_names)
-        if pred_df.empty:
-            continue
-        actions_available = [a for a in actions_te if a in actions]
+        actions_available = [a for a in actions_te if a in action_models]
         if not actions_available:
             continue
-        use_cols = [c for c in actions_available if c in pred_df.columns]
-        if NONE_CLASS not in pred_df.columns:
+        pred_cols = []
+        meta_ref = None
+        for action in actions_available:
+            model = action_models[action]
+            pred_action, meta_sorted = _predict_video(model, feat, meta_te, X_df.columns.tolist(), mean, std, [action])
+            if pred_action.empty:
+                continue
+            meta_ref = meta_sorted
+            pred_cols.append(pred_action.rename(columns={action: action}))
+        if not pred_cols or meta_ref is None:
             continue
-        use_cols.append(NONE_CLASS)
-        prob_use = pred_df[use_cols]
-        seg = predict_multiclass_softmax(prob_use, meta_sorted, none_label=NONE_CLASS)
-        if not seg.empty:
-            submission_list.append(seg)
+        combined = pd.concat(pred_cols, axis=1).fillna(0.0)
+        submission_list.append(predict_multiclass_adaptive(combined[actions_available], meta_ref, action_thresholds))
     torch.cuda.empty_cache()
 
 # %%
