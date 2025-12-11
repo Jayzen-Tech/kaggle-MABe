@@ -4,7 +4,7 @@
 # git config --global --add safe.directory /kaggle/MABe
 # git init
 git add .
-git commit -m "mabe-transformers-gpu.py"
+git commit -m "mabe-transformers-multi-action.py"
 # git branch -M main
 # git remote add origin git@github.com:Jayzen-Tech/kaggle-MABe.git
 git push -u origin main
