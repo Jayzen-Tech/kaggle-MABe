@@ -38,15 +38,66 @@ N_SAMPLES=4_500_000
 LEAST_POS_PERC = 0.05
 _safe_token = re.compile(r'[^A-Za-z0-9]+')
 # ---- runtime switches ----
-ONLY_TUNE_THRESHOLDS = False     # True: only search thresholds and save; skip training/inference/submission
+ONLY_TUNE_THRESHOLDS = True     # True: only search thresholds and save; skip training/inference/submission
 USE_ADAPTIVE_THRESHOLDS = True   # False: use constant 0.27 for all actions, skip tuning/loading
 LOAD_THRESHOLDS = False          # True: load thresholds from THRESHOLD_DIR instead of tuning
 LOAD_MODELS = False              # True: load models from MODEL_DIR instead of training
 CHECK_LOAD = False
-THRESHOLD_DIR = "./models/threshold"
-MODEL_DIR = "./models"
+THRESHOLD_DIR = "./models-4500000/threshold"
+MODEL_DIR = "./models-4500000"
 THRESHOLD_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/7/threshold"      # load thresholds from here
 MODEL_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/7"              # load models from here
+
+NON_FINITE_LOG = "non_finite_features.log"
+
+def _meta_summary(meta_df: Optional[pd.DataFrame]) -> str:
+    if meta_df is None or len(meta_df) == 0:
+        return "video=unknown agent=unknown target=unknown"
+    first = meta_df.iloc[0]
+    idx = first.index
+    video = str(first['video_id']) if 'video_id' in idx else 'unknown'
+    agent = str(first['agent_id']) if 'agent_id' in idx else 'unknown'
+    target = str(first['target_id']) if 'target_id' in idx else 'unknown'
+    return f"video={video} agent={agent} target={target}"
+
+def log_non_finite_features(df: Optional[pd.DataFrame], context: str) -> None:
+    if df is None or len(df) == 0:
+        return
+    numeric_df = df.select_dtypes(include=[np.number])
+    if numeric_df.empty:
+        return
+    values = numeric_df.to_numpy(dtype=np.float64, copy=False)
+    if values.size == 0:
+        return
+    nan_mask = np.isnan(values)
+    posinf_mask = np.isposinf(values)
+    neginf_mask = np.isneginf(values)
+    if not (nan_mask.any() or posinf_mask.any() or neginf_mask.any()):
+        return
+
+    timestamp = pd.Timestamp.now().isoformat()
+    lines = [f"[{timestamp}] {context} rows={len(df)} cols={len(df.columns)}"]
+    for col_idx, col_name in enumerate(numeric_df.columns):
+        n_nan = int(nan_mask[:, col_idx].sum())
+        n_posinf = int(posinf_mask[:, col_idx].sum())
+        n_neginf = int(neginf_mask[:, col_idx].sum())
+        if n_nan or n_posinf or n_neginf:
+            lines.append(f"    {col_name}: nan={n_nan}, +inf={n_posinf}, -inf={n_neginf}")
+
+    with open(NON_FINITE_LOG, "a", encoding="utf-8") as log_file:
+        log_file.write("\n".join(lines) + "\n")
+
+def sanitize_features(X: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if X is None or len(X) == 0:
+        return X
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.interpolate(axis=0, limit_direction='both')
+    if X.isna().any().any():
+        med = X.median(axis=0)
+        X = X.fillna(med)
+    if X.isna().any().any():
+        X = X.fillna(0.0)
+    return X
 
 # %%
 
@@ -78,82 +129,6 @@ def _slugify(text: str) -> str:
         return base
     digest = hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
     return f"{base[:max_len - len(digest) - 1]}-{digest}"
-
-def sanitize_features(X: pd.DataFrame, clip=1e6) -> pd.DataFrame:
-    # 把 inf 变成 NaN（XGB 支持 NaN missing）
-    X = X.replace([np.inf, -np.inf], np.nan)
-
-    # 可选：限制极端值，避免 float32 溢出（尤其 wavelet/fft/kl 这类）
-    if clip is not None:
-        X = X.clip(lower=-clip, upper=clip)
-
-    # 保持 float32（省显存/加速），但确保不会溢出成 inf
-    return X.astype(np.float32, copy=False)
-def log_bad_values(
-    X: pd.DataFrame,
-    *,
-    stage: str,
-    switch: str,
-    action: str = None,
-    body_parts: str = None,
-    topk: int = 10,
-    abort: bool = False,
-):
-    """
-    检查 X 中的 inf / nan / 极端值，并打印详细日志
-    """
-    arr = X.to_numpy()
-    is_nan = np.isnan(arr)
-    is_inf = np.isinf(arr)
-    is_bad = is_nan | is_inf
-
-    if not is_bad.any():
-        return False  # 没问题
-
-    n_rows, n_cols = arr.shape
-    bad_rows = np.where(is_bad.any(axis=1))[0]
-    bad_cols = np.where(is_bad.any(axis=0))[0]
-
-    print("\n" + "=" * 80)
-    print("[NUMERIC ERROR DETECTED]")
-    print(f"  stage       : {stage}")
-    print(f"  switch      : {switch}")
-    if action is not None:
-        print(f"  action      : {action}")
-    if body_parts is not None:
-        print(f"  body_parts  : {body_parts}")
-    print(f"  shape       : {X.shape}")
-    print(f"  bad rows    : {len(bad_rows)} / {n_rows}")
-    print(f"  bad cols    : {len(bad_cols)} / {n_cols}")
-
-    # 列级别统计
-    col_stats = []
-    for j in bad_cols:
-        col = X.columns[j]
-        nan_cnt = is_nan[:, j].sum()
-        inf_cnt = is_inf[:, j].sum()
-        max_val = np.nanmax(arr[:, j])
-        min_val = np.nanmin(arr[:, j])
-        col_stats.append((col, nan_cnt, inf_cnt, min_val, max_val))
-
-    col_stats = sorted(col_stats, key=lambda x: x[2] + x[1], reverse=True)
-
-    print("\n[TOP BAD COLUMNS]")
-    for col, nan_cnt, inf_cnt, mn, mx in col_stats[:topk]:
-        print(
-            f"  {col:30s} | nan={nan_cnt:6d} inf={inf_cnt:6d} "
-            f"min={mn:.3e} max={mx:.3e}"
-        )
-
-    # 行样本（只打前几行）
-    print("\n[SAMPLE BAD ROW INDICES]", bad_rows[:10])
-
-    print("=" * 80 + "\n")
-
-    if abort:
-        raise FloatingPointError("Detected inf/nan in features")
-
-    return True
 
 # %%
 # ================= StratifiedSubsetClassifier =================
@@ -516,6 +491,12 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None,
         del vid
         pvid = pvid.reorder_levels([1,2,0], axis=1).T.sort_index().T
         pvid = (pvid / float(row.pix_per_cm_approx)).astype('float32', copy=False)
+        pvid = pvid.sort_index(axis=1)
+        pvid = pvid.interpolate(limit_direction='both')
+        pvid = pvid.fillna(method='bfill').fillna(method='ffill')
+        all_nan_cols = pvid.columns[pvid.isna().all()]
+        if len(all_nan_cols) > 0:
+            pvid = pvid.drop(columns=all_nan_cols)
 
         # available mouse_id labels in tracking (could be ints or strings)
         avail = list(pvid.columns.get_level_values('mouse_id').unique())
@@ -1009,183 +990,6 @@ def add_segmental_features_single(
     return X
 
 
-def _build_pose_matrix(single_mouse, available_body_parts):
-    pose_cols = {}
-    for part in available_body_parts:
-        try:
-            part_df = single_mouse[part]
-        except KeyError:
-            continue
-        for axis in ('x', 'y'):
-            if axis in part_df:
-                pose_cols[f'{part}_{axis}'] = part_df[axis]
-    if not pose_cols:
-        return None
-    pose_df = pd.DataFrame(pose_cols)
-    pose_df = pose_df.interpolate(limit_direction='both').fillna(method='ffill').fillna(method='bfill')
-    return pose_df
-
-
-def add_pose_pca_features(X, single_mouse, available_body_parts, fps, n_components=3):
-    pose_df = _build_pose_matrix(single_mouse, available_body_parts)
-    if pose_df is None or pose_df.shape[1] < 4:
-        return X
-    pose_arr = pose_df.to_numpy(dtype=np.float32, copy=False)
-    if pose_arr.shape[0] < n_components + 5:
-        return X
-    col_means = np.nanmean(pose_arr, axis=0)
-    pose_arr = pose_arr - col_means
-    pose_arr = np.nan_to_num(pose_arr, copy=False)
-    try:
-        _, _, vt = np.linalg.svd(pose_arr, full_matrices=False)
-    except np.linalg.LinAlgError:
-        return X
-    k = min(n_components, vt.shape[0])
-    proj = pose_arr @ vt[:k].T
-    proj_df = pd.DataFrame(proj, index=pose_df.index,
-                           columns=[f'pose_pc{i+1}' for i in range(k)])
-    for i in range(k):
-        pc_series = proj_df.iloc[:, i]
-        vel = pc_series.diff() * float(fps)
-        acc = vel.diff() * float(fps)
-        drift_window = max(3, _scale(120, fps))
-        ac_shift = max(1, _scale(45, fps))
-        ac_window = max(ac_shift * 2, _scale(90, fps))
-        X[f'pose_pc{i+1}'] = pc_series
-        X[f'pose_pc{i+1}_vel'] = vel
-        X[f'pose_pc{i+1}_acc'] = acc
-        roll_mean = pc_series.rolling(drift_window, min_periods=max(3, drift_window // 3)).mean()
-        X[f'pose_pc{i+1}_drift'] = (pc_series - roll_mean)
-        X[f'pose_pc{i+1}_autoc'] = pc_series.rolling(
-            ac_window, min_periods=max(3, ac_window // 3)
-        ).corr(pc_series.shift(ac_shift))
-    return X
-
-
-def _rolling_fft_stat(series, fps, window_size, mode):
-    if window_size < 4 or len(series) < window_size:
-        return pd.Series(np.nan, index=series.index)
-    fps_eff = float(fps) if fps and fps > 0 else 30.0
-    min_len = max(8, window_size // 2)
-
-    def _calc(arr):
-        arr = arr[np.isfinite(arr)]
-        if arr.size < min_len:
-            return np.nan
-        arr = arr - arr.mean()
-        if not np.any(arr):
-            return 0.0
-        fft_vals = np.fft.rfft(arr)
-        power = np.abs(fft_vals) ** 2
-        freq = np.fft.rfftfreq(arr.size, d=1.0 / fps_eff)
-        if power.size <= 1:
-            return 0.0
-        if mode == 'dom':
-            idx = np.argmax(power[1:]) + 1
-            return freq[idx]
-        power_slice = power[1:]
-        freq_slice = freq[1:]
-        tot = power_slice.sum()
-        if tot <= 0:
-            return 0.0
-        if mode == 'ratio':
-            high = power_slice[freq_slice >= 3.0].sum()
-            return high / tot
-        if mode == 'entropy':
-            p = power_slice / tot
-            return -np.sum(p * np.log(p + 1e-12))
-        return 0.0
-
-    return series.rolling(window_size, min_periods=min_len).apply(_calc, raw=True)
-
-
-def add_frequency_domain_features(X, series, fps, prefix, windows=(30, 90)):
-    for window in windows:
-        ws = _scale(window, fps)
-        dom = _rolling_fft_stat(series, fps, ws, 'dom')
-        ratio = _rolling_fft_stat(series, fps, ws, 'ratio')
-        entropy = _rolling_fft_stat(series, fps, ws, 'entropy')
-        X[f'{prefix}_fft_dom_{window}'] = dom
-        X[f'{prefix}_fft_ratio_{window}'] = ratio
-        X[f'{prefix}_fft_entropy_{window}'] = entropy
-    return X
-
-
-def add_wavelet_energy_features(X, series, fps, prefix, width_bases=(5, 15, 45)):
-    if series is None or len(series) == 0:
-        return X
-    filled = series.fillna(method='ffill').fillna(method='bfill').fillna(0.0)
-    widths = [max(1, _scale(w, fps)) for w in width_bases]
-    try:
-        coeffs = signal.cwt(filled.to_numpy(dtype=np.float32, copy=False), signal.ricker, widths)
-    except Exception:
-        return X
-    for idx, base in enumerate(width_bases):
-        energy = np.abs(coeffs[idx]) ** 2
-        smooth = pd.Series(energy, index=series.index).rolling(
-            max(1, widths[idx] // 2), min_periods=1
-        ).mean()
-        X[f'{prefix}_wave_en_{base}'] = smooth
-    return X
-
-
-def add_periodicity_features(X, series, fps, prefix, lags=(30, 90, 150)):
-    for lag in lags:
-        shift = max(1, _scale(lag, fps))
-        window = max(shift * 2, _scale(lag * 2, fps))
-        corr = series.rolling(window, min_periods=max(3, window // 3)).corr(series.shift(shift))
-        X[f'{prefix}_autoc_{lag}'] = corr
-    return X
-
-
-def _unwrap_angle(angle_series):
-    vals = angle_series.to_numpy(dtype=np.float64, copy=False)
-    mask = np.isfinite(vals)
-    if mask.sum() < 2:
-        return angle_series
-    vals_unwrapped = np.copy(vals)
-    vals_unwrapped[mask] = np.unwrap(vals[mask])
-    return pd.Series(vals_unwrapped, index=angle_series.index)
-
-
-def add_relative_angle_features_single(X, single_mouse, fps):
-    combos = [
-        ('nose', 'tail_base', 'nt'),
-        ('nose', 'body_center', 'nb'),
-        ('ear_left', 'ear_right', 'ears'),
-    ]
-    for part_a, part_b, name in combos:
-        if part_a in single_mouse.columns.get_level_values(0) and part_b in single_mouse.columns.get_level_values(0):
-            ax = single_mouse[part_a]['x'] - single_mouse[part_b]['x']
-            ay = single_mouse[part_a]['y'] - single_mouse[part_b]['y']
-            angle = np.arctan2(ay, ax)
-            angle = _unwrap_angle(pd.Series(angle, index=single_mouse.index))
-            ang_vel = angle.diff() * float(fps)
-            ang_acc = ang_vel.diff() * float(fps)
-            X[f'{name}_ang_vel'] = ang_vel
-            X[f'{name}_ang_acc'] = ang_acc
-    return X
-
-
-def add_relative_angle_features_pair(X, mouse_pair, fps):
-    combos = [
-        (('A', 'nose'), ('B', 'nose'), 'nn'),
-        (('A', 'body_center'), ('B', 'body_center'), 'bc'),
-    ]
-    for (side_a, part_a), (side_b, part_b), tag in combos:
-        try:
-            ax = mouse_pair[side_a][part_a]['x'] - mouse_pair[side_b][part_b]['x']
-            ay = mouse_pair[side_a][part_a]['y'] - mouse_pair[side_b][part_b]['y']
-        except KeyError:
-            continue
-        angle = np.arctan2(ay, ax)
-        angle = _unwrap_angle(pd.Series(angle, index=mouse_pair.index))
-        ang_vel = angle.diff() * float(fps)
-        X[f'{tag}_ang_vel'] = ang_vel
-        X[f'{tag}_ang_speed'] = ang_vel.abs()
-    return X
-
-
 # %%
 def transform_single(single_mouse, body_parts_tracked, fps):
     """Enhanced single mouse transform (FPS-aware windows/lags; distances in cm)."""
@@ -1239,7 +1043,6 @@ def transform_single(single_mouse, body_parts_tracked, fps):
     if 'body_center' in available_body_parts:
         cx = single_mouse['body_center']['x']
         cy = single_mouse['body_center']['y']
-        speed = np.sqrt(cx.diff()**2 + cy.diff()**2) * float(fps)
 
         for w in [5, 15, 30, 60]:
             ws = _scale(w, fps)
@@ -1265,10 +1068,7 @@ def transform_single(single_mouse, body_parts_tracked, fps):
         X = add_speed_asymmetry_future_past_single(X, cx, cy, fps, horizon_base=30)         
         X = add_gauss_shift_speed_future_past_single(X, cx, cy, fps, window_base=30)
         X = add_segmental_features_single(X, cx, cy, fps, horizons_base=(30, 90))
-        X = add_frequency_domain_features(X, speed.fillna(0.0), fps, prefix='sp', windows=(30, 90, 150))
-        X = add_wavelet_energy_features(X, speed.fillna(0.0), fps, prefix='sp', width_bases=(5, 15, 45))
-        X = add_periodicity_features(X, speed.fillna(0.0), fps, prefix='sp', lags=(30, 90, 150))
-
+  
     # Nose-tail features with duration-aware lags
     if all(p in available_body_parts for p in ['nose', 'tail_base']):
         nt_dist = np.sqrt((single_mouse['nose']['x'] - single_mouse['tail_base']['x'])**2 +
@@ -1289,32 +1089,13 @@ def transform_single(single_mouse, body_parts_tracked, fps):
         X['ear_con'] = ear_d.rolling(w, min_periods=1, center=True).std() / \
                        (ear_d.rolling(w, min_periods=1, center=True).mean() + 1e-6)
 
-    X = add_pose_pca_features(X, single_mouse, available_body_parts, fps)
-    X = add_relative_angle_features_single(X, single_mouse, fps)
-
-
-    X = X.astype(np.float32, copy=False)
-
-    log_bad_values(
-        X,
-        stage="transform_pair",
-        switch="pair",
-        body_parts=str(body_parts_tracked),
-        abort=False
-    )
-
-    return X
+    X = sanitize_features(X)
+    return X.astype(np.float32, copy=False)
 
 def transform_pair(mouse_pair, body_parts_tracked, fps):
     """Enhanced pair transform (FPS-aware windows/lags; distances in cm)."""
     avail_A = mouse_pair['A'].columns.get_level_values(0)
     avail_B = mouse_pair['B'].columns.get_level_values(0)
-    rel_dist = rel_dist_sq = None
-    if 'body_center' in avail_A and 'body_center' in avail_B:
-        rel_dx = mouse_pair['A']['body_center']['x'] - mouse_pair['B']['body_center']['x']
-        rel_dy = mouse_pair['A']['body_center']['y'] - mouse_pair['B']['body_center']['y']
-        rel_dist = np.sqrt(rel_dx**2 + rel_dy**2)
-        rel_dist_sq = rel_dx**2 + rel_dy**2
 
     # Inter-mouse distances (squared distances across all part pairs)
     X = pd.DataFrame({
@@ -1419,15 +1200,17 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         X['appr'] = cur - past
 
     # Distance bins (cm; unchanged by fps)
-    if rel_dist is not None:
-        X['v_cls'] = (rel_dist < 5.0).astype(float)
-        X['cls']   = ((rel_dist >= 5.0) & (rel_dist < 15.0)).astype(float)
-        X['med']   = ((rel_dist >= 15.0) & (rel_dist < 30.0)).astype(float)
-        X['far']   = (rel_dist >= 30.0).astype(float)
+    if 'body_center' in avail_A and 'body_center' in avail_B:
+        cd = np.sqrt((mouse_pair['A']['body_center']['x'] - mouse_pair['B']['body_center']['x'])**2 +
+                     (mouse_pair['A']['body_center']['y'] - mouse_pair['B']['body_center']['y'])**2)
+        X['v_cls'] = (cd < 5.0).astype(float)
+        X['cls']   = ((cd >= 5.0) & (cd < 15.0)).astype(float)
+        X['med']   = ((cd >= 15.0) & (cd < 30.0)).astype(float)
+        X['far']   = (cd >= 30.0).astype(float)
 
     # Temporal interaction features (fps-adjusted windows)
-    if rel_dist_sq is not None:
-        cd_full = rel_dist_sq
+    if 'body_center' in avail_A and 'body_center' in avail_B:
+        cd_full = np.square(mouse_pair['A']['body_center'] - mouse_pair['B']['body_center']).sum(axis=1, skipna=False)
 
         for w in [5, 15, 30, 60]:
             ws = _scale(w, fps)
@@ -1447,12 +1230,6 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
             coord = Axd * Bxd + Ayd * Byd
             X[f'co_m{w}'] = coord.rolling(ws, **roll).mean()
             X[f'co_s{w}'] = coord.rolling(ws, **roll).std()
-
-        rel_dist_filled = rel_dist.fillna(method='ffill').fillna(method='bfill') if rel_dist is not None else None
-        if rel_dist_filled is not None:
-            X = add_frequency_domain_features(X, rel_dist_filled, fps, prefix='rd', windows=(30, 90, 150))
-            X = add_wavelet_energy_features(X, rel_dist_filled, fps, prefix='rd', width_bases=(5, 15, 45))
-            X = add_periodicity_features(X, rel_dist_filled, fps, prefix='rd', lags=(30, 90, 150))
 
     # Nose-nose dynamics (duration-aware lags)
     if 'nose' in avail_A and 'nose' in avail_B:
@@ -1500,11 +1277,6 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
             for thr in (8.0, 12.0, 15.0):
                 X[f'nn_ct{int(thr)}_{w}'] = (nn < thr).rolling(ws, **roll_opts).mean()
 
-        nn_filled = nn.fillna(method='ffill').fillna(method='bfill')
-        X = add_frequency_domain_features(X, nn_filled, fps, prefix='nn', windows=(30, 90, 150))
-        X = add_wavelet_energy_features(X, nn_filled, fps, prefix='nn', width_bases=(5, 15, 45))
-        X = add_periodicity_features(X, nn_filled, fps, prefix='nn', lags=(30, 90, 150))
-
     # Velocity alignment (duration-aware offsets)
     if 'body_center' in avail_A and 'body_center' in avail_B:
         Avx = mouse_pair['A']['body_center']['x'].diff()
@@ -1523,21 +1295,10 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
 
         # Advanced interaction (fps-adjusted internals)
         X = add_interaction_features(X, mouse_pair, avail_A, avail_B, fps)
+        
 
-    X = add_relative_angle_features_pair(X, mouse_pair, fps)
-
-    X = X.astype(np.float32, copy=False)
-
-    log_bad_values(
-        X,
-        stage="transform_pair",
-        switch="pair",
-        body_parts=str(body_parts_tracked),
-        abort=False
-    )
-
-    return X
-
+    X = sanitize_features(X)
+    return X.astype(np.float32, copy=False)
 
 
 # %%
@@ -1781,6 +1542,10 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
                 X_te = transform_single(data_te, body_parts_tracked, fps_i)
             else:
                 X_te = transform_pair(data_te, body_parts_tracked, fps_i)
+            log_non_finite_features(
+                X_te,
+                f"test|{switch_te}|n_parts={len(body_parts_tracked)}|{_meta_summary(meta_te)}"
+            )
 
             del data_te
 
@@ -1905,6 +1670,10 @@ for section in range(len(body_parts_tracked_list)):
         ):
             fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
             Xi_full = transform_single(data_i, body_parts_tracked, fps_i).astype(np.float32)
+            log_non_finite_features(
+                Xi_full,
+                f"train|single|section={section}|n_parts={len(body_parts_tracked)}|{_meta_summary(meta_i)}"
+            )
 
             if single_needs_sampling and frames_i > 0:
                 sample_n = int(round(N_CUT * (frames_i / total_single_frames)))
@@ -1972,6 +1741,10 @@ for section in range(len(body_parts_tracked_list)):
         ):
             fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
             Xi_full = transform_pair(data_i, body_parts_tracked, fps_i).astype(np.float32)
+            log_non_finite_features(
+                Xi_full,
+                f"train|pair|section={section}|n_parts={len(body_parts_tracked)}|{_meta_summary(meta_i)}"
+            )
 
             if pair_needs_sampling and frames_i > 0:
                 sample_n = int(round(N_CUT * (frames_i / total_pair_frames)))
