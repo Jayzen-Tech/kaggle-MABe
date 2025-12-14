@@ -748,6 +748,8 @@ def _train_transformer(groups: List[dict], input_dim: int, action_name: str):
     best_state = None
     best_val = float('inf')
     tuned_threshold = THRESHOLD_DEFAULT
+    val_probs_collect = []
+    val_targets_collect = []
     epoch_times = deque(maxlen=5)
     for epoch in range(EPOCHS):
         epoch_start = time.time()
@@ -782,8 +784,6 @@ def _train_transformer(groups: List[dict], input_dim: int, action_name: str):
             val_loss = 0.0
             val_count = 0
             val_tp = val_fp = val_fn = 0.0
-            val_probs_collect = []
-            val_targets_collect = []
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb = xb.to(device)

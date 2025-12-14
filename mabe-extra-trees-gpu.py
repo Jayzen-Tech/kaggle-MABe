@@ -28,25 +28,33 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import f1_score
 
 warnings.filterwarnings('ignore')
-USE_GPU = ("KAGGLE_KERNEL_RUN_TYPE" in __import__("os").environ) and (__import__("shutil").which("nvidia-smi") is not None)
-print(f'Using GPU? {USE_GPU}')
+USE_GPU = True
 
 from xgboost import XGBClassifier
 
 SEED = 1234
 N_CUT = 1_000_000_000
-LEAST_POS_PERC = 0.0
+N_SAMPLES=4_500_000
+LEAST_POS_PERC = 0.05
 _safe_token = re.compile(r'[^A-Za-z0-9]+')
 # ---- runtime switches ----
 ONLY_TUNE_THRESHOLDS = False     # True: only search thresholds and save; skip training/inference/submission
-USE_ADAPTIVE_THRESHOLDS = True   # False: use constant 0.27 for all actions, skip tuning/loading
+USE_ADAPTIVE_THRESHOLDS = False   # False: use constant 0.27 for all actions, skip tuning/loading
 LOAD_THRESHOLDS = False          # True: load thresholds from THRESHOLD_DIR instead of tuning
 LOAD_MODELS = False              # True: load models from MODEL_DIR instead of training
-CHECK_LOAD = True
-THRESHOLD_DIR = "./threshold"            # save thresholds here
-MODEL_DIR = "./models"                  # save models here
-THRESHOLD_LOAD_DIR = THRESHOLD_DIR      # load thresholds from here
-MODEL_LOAD_DIR = MODEL_DIR              # load models from here
+CHECK_LOAD = False
+THRESHOLD_DIR = "./threshold"
+MODEL_DIR = "./models"
+THRESHOLD_LOAD_DIR = "/kaggle/input/xgb-threshold/threshold"      # load thresholds from here
+MODEL_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/4"              # load models from here
+
+# %%
+
+# MODIFIED: imports for ST-GCN
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
 
 # %%
 # --- SEED EVERYTHING -----
@@ -70,7 +78,6 @@ def _slugify(text: str) -> str:
         return base
     digest = hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
     return f"{base[:max_len - len(digest) - 1]}-{digest}"
-
 
 # %%
 # ================= StratifiedSubsetClassifier =================
@@ -486,8 +493,8 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None,
             for c in ('lab_id','video_id','agent_id','target_id','arena_shape'):
                 m[c] = m[c].astype('category')
             # Align index to frame numbers so sampling with .loc on frame ids works.
-            # m = m.set_index('video_frame')
-            # m['video_frame'] = m.index
+            m = m.set_index('video_frame')
+            m['video_frame'] = m.index
             return m
 
         # ---------- SINGLE ----------
@@ -774,6 +781,7 @@ def add_longrange_features(
 
     return X
 
+
 def add_cumulative_distance_single(X, cx, cy, fps, horizon_frames_base: int = 180, colname: str = "path_cum180"):
     L = max(1, _scale(horizon_frames_base, fps))  # frames
     # step length (cm per frame since coords are cm)
@@ -1041,7 +1049,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
 
     # Speed-like features via lagged displacements (duration-aware lag)
     if ('A', 'ear_left') in mouse_pair.columns and ('B', 'ear_left') in mouse_pair.columns:
-        speed_lags = [5, 10, 20, 30]
+        speed_lags = [1,2,3,4,5, 10, 20, 30,40,50,60]
         speed_parts = []
         for lag_base in speed_lags:
             lag = _scale(lag_base, fps)
@@ -1062,6 +1070,9 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
                 sp_B=speeds['sp_B_l10'],
             )
         X = pd.concat([X, speeds], axis=1)
+
+    if 'nose+tail_base' in X.columns and 'ear_left+ear_right' in X.columns:
+        X['elong'] = X['nose+tail_base'] / (X['ear_left+ear_right'] + 1e-6)
 
     # Relative orientation
     if all(p in avail_A for p in ['nose', 'tail_base', 'body_center']) and all(p in avail_B for p in ['nose', 'tail_base', 'body_center']):
@@ -1172,7 +1183,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
             X[f'nn_ch{lag}']  = nn - nn.shift(l)
             is_cl = (nn < 10.0).astype(float)
             X[f'cl_ps{lag}']  = is_cl.rolling(l, min_periods=1).mean()
-
+            
         # Nose approach vs lateral slip (cm/s; >0 means separating along radial line)
         rel_x = mouse_pair['A']['nose']['x'] - mouse_pair['B']['nose']['x']
         rel_y = mouse_pair['A']['nose']['y'] - mouse_pair['B']['nose']['y']
@@ -1193,7 +1204,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         X['nose_spdA'] = A_sp
         X['nose_spdB'] = B_sp
         X['nose_spd_gap'] = gap_sp
-        for lag in [5, 10, 20, 30]:
+        for lag in [1,2,3,4,5, 10, 20, 30,40,50,60]:
             l = _scale(lag, fps)
             X[f'nose_spdA_lg{lag}'] = A_sp.shift(l)
             X[f'nose_spdB_lg{lag}'] = B_sp.shift(l)
@@ -1257,7 +1268,7 @@ def tune_threshold(oof_pred: np.ndarray, y_true: np.ndarray) -> float:
 
 
 # %%
-def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples=1_500_000):
+def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples=N_SAMPLES):
     slug = _slugify(body_parts_tracked_str)
     thr_dir = THRESHOLD_DIR
     mdl_dir = MODEL_DIR
@@ -1610,7 +1621,7 @@ for section in range(len(body_parts_tracked_list)):
                 pos_idx = np.where(y_arr == 1)[0]
                 neg_idx = np.where(y_arr == 0)[0]
                 n_pos = len(pos_idx); n_neg = len(neg_idx)
-                target_pos = min(n_pos, max(0, int(round(sample_n * LEAST_POS_PERC)))) if n_pos > 0 else 0
+                target_pos = min(n_pos, max(int(round(n_pos*sample_n/frames_i)), int(round(sample_n * LEAST_POS_PERC)))) if n_pos > 0 else 0
                 target_neg = sample_n - target_pos
                 if np.min(np.bincount(y_arr, minlength=2)) < 2 or sample_n >= len(y_arr):
                     strat_idx = rng.choice(len(y_arr), size=sample_n, replace=False)
@@ -1676,7 +1687,7 @@ for section in range(len(body_parts_tracked_list)):
                 pos_idx = np.where(y_arr == 1)[0]
                 neg_idx = np.where(y_arr == 0)[0]
                 n_pos = len(pos_idx); n_neg = len(neg_idx)
-                target_pos = min(n_pos, max(0, int(round(sample_n * LEAST_POS_PERC)))) if n_pos > 0 else 0
+                target_pos = min(n_pos, max(int(round(n_pos*sample_n/frames_i)), int(round(sample_n * LEAST_POS_PERC)))) if n_pos > 0 else 0
                 target_neg = sample_n - target_pos
                 if np.min(np.bincount(y_arr, minlength=2)) < 2 or sample_n >= len(y_arr):
                     strat_idx = rng.choice(len(y_arr), size=sample_n, replace=False)
@@ -1738,3 +1749,5 @@ submission_robust = robustify(submission, test, 'test')
 submission_robust.index.name = 'row_id'
 submission_robust.to_csv('submission.csv')
 print(f"\nSubmission created: {len(submission_robust)} predictions")
+
+

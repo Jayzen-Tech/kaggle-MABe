@@ -4,7 +4,7 @@
 # git config --global --add safe.directory /kaggle/MABe
 # git init
 git add .
-git commit -m "mabe-transformers-single-action.py"
+git commit -m "model upload"
 # git branch -M main
 # git remote add origin git@github.com:Jayzen-Tech/kaggle-MABe.git
 git push -u origin main
