@@ -34,17 +34,17 @@ from xgboost import XGBClassifier
 
 SEED = 1234
 N_CUT = 1_000_000_000
-N_SAMPLES=4_500_000
+N_SAMPLES=1_500_000
 LEAST_POS_PERC = 0.05
 _safe_token = re.compile(r'[^A-Za-z0-9]+')
 # ---- runtime switches ----
-ONLY_TUNE_THRESHOLDS = True     # True: only search thresholds and save; skip training/inference/submission
+ONLY_TUNE_THRESHOLDS = False     # True: only search thresholds and save; skip training/inference/submission
 USE_ADAPTIVE_THRESHOLDS = True   # False: use constant 0.27 for all actions, skip tuning/loading
 LOAD_THRESHOLDS = False          # True: load thresholds from THRESHOLD_DIR instead of tuning
 LOAD_MODELS = False              # True: load models from MODEL_DIR instead of training
 CHECK_LOAD = False
-THRESHOLD_DIR = "./models-4500000/threshold"
-MODEL_DIR = "./models-4500000"
+THRESHOLD_DIR = "./models/threshold"
+MODEL_DIR = "./models"
 THRESHOLD_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/7/threshold"      # load thresholds from here
 MODEL_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/7"              # load models from here
 
@@ -1631,6 +1631,9 @@ submission_list = []
 
 for section in range(len(body_parts_tracked_list)):
     body_parts_tracked_str = body_parts_tracked_list[section]
+    if not _slugify(body_parts_tracked_str).startswith("ear"):
+        print(f"[warn] skipping non-ear body parts combo: {body_parts_tracked_str}")
+        continue
     # try:
     body_parts_tracked = json.loads(body_parts_tracked_str)
     print(f"{section}. Processing: {len(body_parts_tracked)} body parts")

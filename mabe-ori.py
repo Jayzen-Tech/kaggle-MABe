@@ -35,14 +35,6 @@ from catboost import CatBoostClassifier
 SEED = 1234
 
 # %%
-
-# MODIFIED: imports for ST-GCN
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
-
-# %%
 # --- SEED EVERYTHING -----
 os.environ["PYTHONHASHSEED"] = str(SEED)      # has to be set very early
 
@@ -749,55 +741,27 @@ def add_state_features(X, center_x, center_y, fps):
 
     return X
 
-def add_longrange_features(
-    X,
-    center_x,
-    center_y,
-    fps,
-    long_windows: Optional[list] = None,
-    ewm_spans: Optional[list] = None,
-    pct_windows: Optional[list] = None
-):
-    """
-    Long-range temporal features (windows & spans scaled by fps).
-    Parameters:
-      - X: DataFrame to append features to
-      - center_x, center_y: pd.Series of coordinates (in cm)
-      - fps: frames per second (float)
-      - long_windows: list of integer window bases (in frames @30fps) for long moving averages (default [120,240,480])
-      - ewm_spans: list of integer spans (in frames @30fps) for EWM (default [60,120,240])
-      - pct_windows: list of integer window bases for speed percentile ranking (default [60,120,240])
-    """
-    if long_windows is None:
-        long_windows = [30, 60,120, 240, 480]
-    if ewm_spans is None:
-        ewm_spans = [15, 30,60, 120, 240]
-    if pct_windows is None:
-        pct_windows = [15, 30,60, 120, 240]
-
-    # long moving average of positions
-    for window in long_windows:
+def add_longrange_features(X, center_x, center_y, fps):
+    """Long-range temporal features (windows & spans scaled by fps)."""
+    for window in [120, 240]:
         ws = _scale(window, fps)
         if len(center_x) >= ws:
             X[f'x_ml{window}'] = center_x.rolling(ws, min_periods=max(5, ws // 6)).mean()
             X[f'y_ml{window}'] = center_y.rolling(ws, min_periods=max(5, ws // 6)).mean()
 
-    # EWM (span interpreted in frames)
-    for span in ewm_spans:
+    # EWM spans also interpreted in frames
+    for span in [60, 120]:
         s = _scale(span, fps)
-        # pandas ewm accepts span as float/int; keep min_periods=1 to avoid excessive NaNs
         X[f'x_e{span}'] = center_x.ewm(span=s, min_periods=1).mean()
         X[f'y_e{span}'] = center_y.ewm(span=s, min_periods=1).mean()
 
-    # speed-based percentile rank over windows
     speed = np.sqrt(center_x.diff()**2 + center_y.diff()**2) * float(fps)  # cm/s
-    for window in pct_windows:
+    for window in [60, 120]:
         ws = _scale(window, fps)
         if len(speed) >= ws:
             X[f'sp_pct{window}'] = speed.rolling(ws, min_periods=max(5, ws // 6)).rank(pct=True)
 
     return X
-
 
 def add_cumulative_distance_single(X, cx, cy, fps, horizon_frames_base: int = 180, colname: str = "path_cum180"):
     L = max(1, _scale(horizon_frames_base, fps))  # frames
@@ -913,42 +877,6 @@ def add_gauss_shift_speed_future_past_single(
     X["spd_symkl_1s"] = (kl_pf + kl_fp).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return X
 
-def add_segmental_features_single(
-    X: pd.DataFrame, cx: pd.Series, cy: pd.Series, fps: float,
-    horizons_base=(30, 90), pause_thr_cms: float = 2.0
-) -> pd.DataFrame:
-    """Segment-level trend/acc/jerk/pause over ~1s/3s windows (fps-aware)."""
-    v = _speed(cx, cy, fps)
-    acc = v.diff() * float(fps)
-    jerk = acc.diff() * float(fps)
-
-    for h in horizons_base:
-        w = max(3, _scale(h, fps))
-        min_p = max(3, w // 3)
-
-        def _slope(arr):
-            arr = arr[np.isfinite(arr)]
-            L = len(arr)
-            if L < 2:
-                return 0.0
-            idx = np.arange(L, dtype=np.float32)
-            sum_x = float(idx.sum())
-            sum_x2 = float((idx * idx).sum())
-            denom = L * sum_x2 - sum_x * sum_x
-            if denom == 0:
-                return 0.0
-            sum_y = float(arr.sum())
-            sum_xy = float((idx * arr).sum())
-            return (L * sum_xy - sum_x * sum_y) / denom
-
-        X[f'sp_sl_{h}'] = v.rolling(w, center=True, min_periods=min_p).apply(_slope, raw=True)
-        X[f'acc_m_{h}'] = acc.rolling(w, center=True, min_periods=min_p).mean()
-        X[f'acc_v_{h}'] = acc.rolling(w, center=True, min_periods=min_p).var()
-        X[f'jerk_m_{h}'] = jerk.rolling(w, center=True, min_periods=min_p).mean()
-        X[f'pause_r_{h}'] = (v < pause_thr_cms).rolling(w, center=True, min_periods=1).mean()
-
-    return X
-
 
 # %%
 def transform_single(single_mouse, body_parts_tracked, fps):
@@ -1013,7 +941,6 @@ def transform_single(single_mouse, body_parts_tracked, fps):
         X = add_groom_microfeatures(X, single_mouse, fps)
         X = add_speed_asymmetry_future_past_single(X, cx, cy, fps, horizon_base=30)         
         X = add_gauss_shift_speed_future_past_single(X, cx, cy, fps, window_base=30)
-        X = add_segmental_features_single(X, cx, cy, fps, horizons_base=(30, 90))
   
     # Nose-tail features with duration-aware lags
     if all(p in available_body_parts for p in ['nose', 'tail_base']):
@@ -1066,54 +993,11 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         X['elong'] = X['nose+tail_base'] / (X['ear_left+ear_right'] + 1e-6)
 
     # Relative orientation
-    if all(p in avail_A for p in ['nose', 'tail_base', 'body_center']) and all(p in avail_B for p in ['nose', 'tail_base', 'body_center']):
+    if all(p in avail_A for p in ['nose', 'tail_base']) and all(p in avail_B for p in ['nose', 'tail_base']):
         dir_A = mouse_pair['A']['nose'] - mouse_pair['A']['tail_base']
         dir_B = mouse_pair['B']['nose'] - mouse_pair['B']['tail_base']
         X['rel_ori'] = (dir_A['x'] * dir_B['x'] + dir_A['y'] * dir_B['y']) / (
             np.sqrt(dir_A['x']**2 + dir_A['y']**2) * np.sqrt(dir_B['x']**2 + dir_B['y']**2) + 1e-6)
-
-        def _ang(dx, dy):
-            return np.arctan2(dy, dx)
-
-        # Nose pointing to opponent body_center (facing vs back/side)
-        ang_A_head = _ang(dir_A['x'], dir_A['y'])
-        ang_B_head = _ang(dir_B['x'], dir_B['y'])
-        ang_A_to_Bc = _ang(mouse_pair['B']['body_center']['x'] - mouse_pair['A']['nose']['x'],
-                           mouse_pair['B']['body_center']['y'] - mouse_pair['A']['nose']['y'])
-        ang_B_to_Ac = _ang(mouse_pair['A']['body_center']['x'] - mouse_pair['B']['nose']['x'],
-                           mouse_pair['A']['body_center']['y'] - mouse_pair['B']['nose']['y'])
-
-        def _wrap_diff(a, b):
-            d = a - b
-            return np.arctan2(np.sin(d), np.cos(d))
-
-        ang_A_diff = _wrap_diff(ang_A_to_Bc, ang_A_head)
-        ang_B_diff = _wrap_diff(ang_B_to_Ac, ang_B_head)
-
-        X['A_face_cos'] = np.cos(ang_A_diff)
-        X['B_face_cos'] = np.cos(ang_B_diff)
-
-        # Facing bins (one-hot-ish)
-        X['A_face_front'] = (X['A_face_cos'] > 0.7).astype(float)
-        X['A_face_back']  = (X['A_face_cos'] < -0.5).astype(float)
-        X['A_face_side']  = ((X['A_face_cos'] <= 0.7) & (X['A_face_cos'] >= -0.5)).astype(float)
-        X['B_face_front'] = (X['B_face_cos'] > 0.7).astype(float)
-        X['B_face_back']  = (X['B_face_cos'] < -0.5).astype(float)
-        X['B_face_side']  = ((X['B_face_cos'] <= 0.7) & (X['B_face_cos'] >= -0.5)).astype(float)
-
-        # Ear-to-opponent-nose wedge: captures side-on vs face-on
-        if all(p in avail_A for p in ['ear_left', 'ear_right']) and 'nose' in avail_B:
-            ang_el = _ang(mouse_pair['B']['nose']['x'] - mouse_pair['A']['ear_left']['x'],
-                          mouse_pair['B']['nose']['y'] - mouse_pair['A']['ear_left']['y'])
-            ang_er = _ang(mouse_pair['B']['nose']['x'] - mouse_pair['A']['ear_right']['x'],
-                          mouse_pair['B']['nose']['y'] - mouse_pair['A']['ear_right']['y'])
-            X['A_ear_wedge'] = np.abs(_wrap_diff(ang_el, ang_er))
-        if all(p in avail_B for p in ['ear_left', 'ear_right']) and 'nose' in avail_A:
-            ang_el = _ang(mouse_pair['A']['nose']['x'] - mouse_pair['B']['ear_left']['x'],
-                          mouse_pair['A']['nose']['y'] - mouse_pair['B']['ear_left']['y'])
-            ang_er = _ang(mouse_pair['A']['nose']['x'] - mouse_pair['B']['ear_right']['x'],
-                          mouse_pair['A']['nose']['y'] - mouse_pair['B']['ear_right']['y'])
-            X['B_ear_wedge'] = np.abs(_wrap_diff(ang_el, ang_er))
 
     # Approach rate (duration-aware lag)
     if all(p in avail_A for p in ['nose']) and all(p in avail_B for p in ['nose']):
@@ -1189,7 +1073,6 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
 
     return X.astype(np.float32, copy=False)
 
-
 # %%
 # helpers
 def _find_lgbm_step(pipe):
@@ -1210,6 +1093,26 @@ def _find_lgbm_step(pipe):
 # %%
 def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples=1_500_000):
     models = []
+    models.append(make_pipeline(
+        StratifiedSubsetClassifier(_make_lgbm(
+            n_estimators=225, learning_rate=0.07, min_child_samples=40,
+            num_leaves=31, subsample=0.8, colsample_bytree=0.8, verbose=-1, gpu_use_dp=USE_GPU
+        ), n_samples)
+    ))
+    models.append(make_pipeline(
+        StratifiedSubsetClassifier(_make_lgbm(
+            n_estimators=150, learning_rate=0.1, min_child_samples=20,
+            num_leaves=63, max_depth=8, subsample=0.7, colsample_bytree=0.9,
+            reg_alpha=0.1, reg_lambda=0.1, verbose=-1, gpu_use_dp=USE_GPU
+        ), (n_samples and int(n_samples/1.25)))
+    ))
+    models.append(make_pipeline(
+        StratifiedSubsetClassifier(_make_lgbm(
+            n_estimators=100, learning_rate=0.05, min_child_samples=30,
+            num_leaves=127, max_depth=10, subsample=0.75, verbose=-1, gpu_use_dp=USE_GPU,
+        ), (n_samples and int(n_samples/1.66)))
+    ))
+
     xgb0 = _make_xgb(
         n_estimators=180, learning_rate=0.08, max_depth=6,
         min_child_weight=8 if USE_GPU else 5, gamma=1.0 if USE_GPU else 0.,
@@ -1218,18 +1121,13 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
     )
     models.append(make_pipeline(StratifiedSubsetClassifier(xgb0, n_samples and int(n_samples/1.2))))
 
-    xgb_250 = _make_xgb(
-        n_estimators=250, learning_rate=0.08, max_depth=6,
-        min_child_weight=8 if USE_GPU else 5, gamma=1.0 if USE_GPU else 0.,
-        subsample=0.8, colsample_bytree=0.8, single_precision_histogram=USE_GPU,
-        verbosity=0
-    )
-    models.append(make_pipeline(StratifiedSubsetClassifier(xgb_250, n_samples and int(n_samples/1.2))))
+    cb_est = _make_cb(iterations=120, learning_rate=0.1, depth=6,
+                      verbose=False, allow_writing_files=False)
+    models.append(make_pipeline(StratifiedSubsetClassifier(cb_est, n_samples)))
 
-    model_names = ['xgb_180','xgb_250']
+    model_names = ['lgbm_225', 'lgbm_150', 'lgbm_100', 'xgb_180', 'cat_120']
 
     if USE_GPU:
-        # GPU-only heavy XGBs etc (same as before)
         xgb1 = XGBClassifier(
             random_state=SEED, booster="gbtree", tree_method="gpu_hist",
             n_estimators=2000, learning_rate=0.05, grow_policy="lossguide",
@@ -1255,14 +1153,28 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
                                             random_state=SEED, valid_size=0.10, val_cap_ratio=0.25,
                                             es_rounds="auto", es_metric="auto")
         ))
-        model_names.extend(['xgb1', 'xgb2'])
+
+        cb1 = CatBoostClassifier(
+            random_seed=SEED, task_type="GPU", devices="0",
+            iterations=4000, learning_rate=0.03, depth=8, l2_leaf_reg=6.0,
+            bootstrap_type="Bayesian", bagging_temperature=0.5,
+            random_strength=0.5, loss_function="Logloss",
+            eval_metric="PRAUC:type=Classic", auto_class_weights="Balanced",
+            border_count=64, verbose=False, allow_writing_files=False
+        )
+        models.append(make_pipeline(
+            StratifiedSubsetClassifierWEval(cb1, n_samples and int(n_samples/2.0),
+                                            random_state=SEED, valid_size=0.10, val_cap_ratio=0.25,
+                                            es_rounds="auto", es_metric="auto")
+        ))
+        model_names.extend(['xgb1', 'xgb2', 'cat_bay'])
 
     model_list = []
     for action in label.columns:
         action_mask = ~label[action].isna().values
         y_action = label[action][action_mask].values.astype(int)
         meta_masked = meta.iloc[action_mask]
-
+  
         trained = []
         for model_idx, m in enumerate(models):
             m_clone = clone(m)
@@ -1310,8 +1222,6 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         assert switch_te == switch_tr
         try:
             fps_i = _fps_from_meta(meta_te, fps_lookup, default_fps=30.0)
-
-            # fallback to original tree-based inference if ST-GCN not used
             if switch_te == 'single':
                 X_te = transform_single(data_te, body_parts_tracked, fps_i)
             else:
@@ -1336,6 +1246,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             try: del data_te
             except: pass
             gc.collect()
+
 
 # %%
 def robustify(submission, dataset, traintest, traintest_directory=None):
