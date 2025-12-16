@@ -1,5 +1,7 @@
 # kaggle-MABe
 
+[Kaggle Competition – Mouse Action Behavior (MABe)](https://www.kaggle.com/competitions/mabe-mouse-behavior-detection)
+
 ## Table of Contents / 目录
 - [English Version](#english-version)
   - [Directory Layout & Required Data](#directory-layout--required-data)
