@@ -1,7 +1,7 @@
 # kaggle-MABe
 
 ## 目录结构与依赖数据
-项目以 `/kaggle/kaggle-MABe` 为工作目录，并依赖多个外部输入。核心目录结构如下：
+项目以 `/kaggle/kaggle-MABe` 为工作目录，并依赖外部输入。核心目录结构如下：
 
 ```
 /kaggle/kaggle-MABe/
