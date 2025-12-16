@@ -30,7 +30,7 @@
 
 ```python
 # ---- runtime switches ----
-ONLY_TUNE_THRESHOLDS = True     # True: 仅搜索阈值并保存；跳过训练/推理/提交
+ONLY_TUNE_THRESHOLDS = False    # True: 仅搜索阈值并保存；跳过训练/推理/提交
 USE_ADAPTIVE_THRESHOLDS = True  # False: 所有动作使用固定 0.27 阈值
 LOAD_THRESHOLDS = False         # True: 从 THRESHOLD_DIR 读取现有阈值，跳过调参
 LOAD_MODELS = False             # True: 从 MODEL_DIR 读取已训练模型

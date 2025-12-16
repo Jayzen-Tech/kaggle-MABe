@@ -77,7 +77,7 @@ def _encode_arena_shape(val) -> int:
     return _ARENA_SHAPE_MAP[key]
 
 # ---- runtime switches ----
-ONLY_TUNE_THRESHOLDS = True     # True: only search thresholds and save; skip training/inference/submission
+ONLY_TUNE_THRESHOLDS = False     # True: only search thresholds and save; skip training/inference/submission
 USE_ADAPTIVE_THRESHOLDS = True   # False: use constant 0.27 for all actions, skip tuning/loading
 LOAD_THRESHOLDS = False          # True: load thresholds from THRESHOLD_DIR instead of tuning
 LOAD_MODELS = False              # True: load models from MODEL_DIR instead of training
