@@ -82,7 +82,7 @@ USE_ADAPTIVE_THRESHOLDS = True   # False: use constant 0.27 for all actions, ski
 LOAD_THRESHOLDS = False          # True: load thresholds from THRESHOLD_DIR instead of tuning
 LOAD_MODELS = False              # True: load models from MODEL_DIR instead of training
 CHECK_LOAD = False
-THRESHOLD_DIR = "./models/threshold-1"
+THRESHOLD_DIR = "./models/threshold"
 MODEL_DIR = "./models"
 THRESHOLD_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/13/threshold"      # load thresholds from here
 MODEL_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/13"              # load models from here
@@ -1686,7 +1686,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
                     if verbose:
                         print(f"threshold tuning skipped (single-class fold) | {switch_tr} | action={action}")
                 else:
-                    base_model = clone(models[1])
+                    base_model = clone(models[0])
                     oof_pred = cross_val_predict(
                         base_model,
                         X_tune,
