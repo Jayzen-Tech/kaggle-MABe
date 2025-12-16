@@ -8,9 +8,9 @@ export HTTPS_PROXY="$https_proxy"
 export no_proxy="127.0.0.1,localhost"
 export NO_PROXY="$no_proxy"
 
-cd /kaggle/MABe/models
+cd ./models-13
 # kaggle models update -p ./models
 kaggle models instances versions create \
   thekog/xgb-models-new/Other/xgb-models-new \
-  -p . -n "N_SAMPLES=4_500_000"
+  -p . -n "sanitize_features" --dir-mode zip
 # kaggle models instances create -p .

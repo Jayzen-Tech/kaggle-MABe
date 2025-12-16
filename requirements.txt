@@ -7,4 +7,6 @@ scikit-learn
 scipy
 torch
 tqdm
-xgboost
+xgboost==2.0.3
+pyarrow
+fastparquet

@@ -1,7 +1,7 @@
 # echo "# kaggle-MABe" >> README.md
 # git config --global user.email 1458038842@qq.com
 # git config --global user.name wangjieyang
-# git config --global --add safe.directory /kaggle/MABe
+# git config --global --add safe.directory /kaggle/kaggle-MABe
 # git init
 git add .
 git commit -m "requirements.txt"
