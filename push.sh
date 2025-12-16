@@ -4,7 +4,7 @@
 # git config --global --add safe.directory /kaggle/kaggle-MABe
 # git init
 git add .
-git commit -m "最终修改"
+git commit -m "add English Version of README"
 # git branch -M main
 # git remote add origin git@github.com:Jayzen-Tech/kaggle-MABe.git
 git push -u origin main
