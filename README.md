@@ -1,10 +1,10 @@
 # kaggle-MABe
 
 ## 目录结构与依赖数据
-项目以 `/kaggle/MABe` 为工作目录，并依赖多个外部输入。核心目录结构如下：
+项目以 `/kaggle/kaggle-MABe` 为工作目录，并依赖多个外部输入。核心目录结构如下：
 
 ```
-/kaggle/MABe/
+/kaggle/kaggle-MABe/
 ├── mabe-final.py                # 最终方案脚本
 ├── baseline/mabe-baseline.py    # 起始 baseline
 ├── models/                      # 训练或加载的模型缓存目录
