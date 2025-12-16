@@ -70,7 +70,7 @@ NON_FINITE_LOG = "non_finite_features.log"
 
 **Recommended usage:**
 - **Full training + inference**: `ONLY_TUNE_THRESHOLDS=False`, `LOAD_MODELS=False`. The script trains, predicts, and saves models/thresholds under `MODEL_DIR` / `THRESHOLD_DIR`.
-- **Threshold tuning only**: When models already exist, set `ONLY_TUNE_THRESHOLDS=True` (default). The run stops after tuning and writes fresh pickles into `THRESHOLD_DIR`.
+- **Threshold tuning only**: When models already exist, set `ONLY_TUNE_THRESHOLDS=True`. The run stops after tuning and writes fresh pickles into `THRESHOLD_DIR`.
 - **Reuse trained models**: Set `LOAD_MODELS=True` (optionally `CHECK_LOAD=True` to verify label availability). The script reads Joblib caches from `MODEL_LOAD_DIR`; update the path if your models live elsewhere.
 - **Reuse tuned thresholds**: Flip `LOAD_THRESHOLDS=True` to skip tuning and read `.pkl` files from `THRESHOLD_LOAD_DIR`.
 - Disable adaptive thresholds (`USE_ADAPTIVE_THRESHOLDS=False`) to fall back to the global 0.27 cutoff for quick sanity checks.
@@ -314,7 +314,7 @@ NON_FINITE_LOG = "non_finite_features.log"
 
 **使用建议：**
 - **全量训练+推理**：将 `ONLY_TUNE_THRESHOLDS=False`，`LOAD_MODELS=False`，脚本会先训练再预测，并把模型/阈值保存到 `MODEL_DIR`、`THRESHOLD_DIR`。
-- **仅调阈值**：当模型已训练好，仅希望在当前折数上重新搜索阈值时，把 `ONLY_TUNE_THRESHOLDS=True`（默认），执行会停止在阈值阶段并把结果写入 `THRESHOLD_DIR`。
+- **仅调阈值**：当模型已训练好，仅希望在当前折数上重新搜索阈值时，把 `ONLY_TUNE_THRESHOLDS=True`，执行会停止在阈值阶段并把结果写入 `THRESHOLD_DIR`。
 - **复用既有模型**：设置 `LOAD_MODELS=True`（必要时 `CHECK_LOAD=True` 验证数据兼容），脚本直接从 `MODEL_LOAD_DIR` 读取 `joblib` 缓存；若文件在自定义位置，请同步更新 `MODEL_LOAD_DIR`。
 - **复用阈值**：将 `LOAD_THRESHOLDS=True`，脚本会跳过调参并读取 `THRESHOLD_LOAD_DIR` 中的 `.pkl` 阈值文件。
 - `USE_ADAPTIVE_THRESHOLDS=False` 时会退回到全局 0.27 阈值，适用于快速 sanity check。
