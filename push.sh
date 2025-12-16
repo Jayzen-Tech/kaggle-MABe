@@ -4,7 +4,7 @@
 # git config --global --add safe.directory /kaggle/kaggle-MABe
 # git init
 git add .
-git commit -m "add baseline"
+git commit -m "添加文档"
 # git branch -M main
 # git remote add origin git@github.com:Jayzen-Tech/kaggle-MABe.git
 git push -u origin main
