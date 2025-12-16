@@ -10,3 +10,4 @@ tqdm
 xgboost==2.0.3
 pyarrow
 fastparquet
+lightgbm

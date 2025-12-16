@@ -165,6 +165,9 @@ def transform_single(...):
         X = add_segmental_features_single(X, cx, cy, fps, horizons_base=(30, 90))
 ```
 
+- **多尺度速度与滞后**：`transform_single` 现在遍历 `speed_lags = [1,2,3,4,5,10,20,30,40,50,60]`，对 `ear_left/right` 与 `tail_base` 组合分别计算平方位移（`mabe-final.py:1194-1225`），lag 会通过 `_scale(lag_base, fps)` 转换成统一的时间长度，兼顾 1～2 帧的瞬时急停与 2 秒以上的持续奔跑。为了兼容已有流水线，还保留了 10 帧 lag 的 `sp_lf`、`sp_rt` 等旧列名。
+- **鼻尾距离的 lag 差分**：`nt_lg{10,20,40}` 与 `nt_df{10,20,40}` 全量复用 fps 感知 shift（`mabe-final.py:1266-1274`），可在任意帧率下稳定观测体长拉伸与快速蜷缩，这些细节在 baseline 中尚未覆盖。
+
 ### 5. 双鼠互动拓展 + 上下文比值
 - `transform_pair` 增强了 inter-mouse lagged speeds、头部朝向、鼻尖/耳朵楔形角度、分段距离统计、鼻尖速度径向/切向拆解、滚动接触比例以及速度对齐等特征。
 - 对所有 CTX 指标提供相对距离比，避免绝对尺度对行为判断的噪声。
@@ -186,6 +189,8 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
     # CTX 比值
     X['ctx_third_min_dist_agent_ratio'] = X['ctx_third_min_dist_agent'] / (cd + 1e-6)
 ```
+
+- **双鼠速度/接近的多 lag 描述**：pair 特征同样扩展为 `speed_lags = [1,2,3,4,5,10,20,30,40,50,60]`（`mabe-final.py:1302-1325`），输出 `sp_A_l{lag}`、`sp_AB_l{lag}`、`sp_B_l{lag}`，把 agent、target 以及交叉位移的短期与长期强度拆开；鼻尖距离则覆盖 lag=1~100 的 `nn_lg*`、`nn_ch*`、`cl_ps*` 与 `nose_spd*_lg*`（`mabe-final.py:1430-1466`），能够检测“快速接近→短暂停留→离开”等节奏。相比 baseline 只有 10/20/40 帧，这些多尺度 lag 提供了更丰富的速度与交互时序信息。
 
 ### 6. 训练/推理阶段特征一致性与异常监控
 - 训练/测试阶段统一使用 `augment_with_meta_features`、`sanitize_features`，并通过 `log_non_finite_features` 记录任何非有限值及上下文，便于排查数据漂移。
