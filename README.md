@@ -1,5 +1,25 @@
 # kaggle-MABe
 
+## 目录结构与依赖数据
+项目以 `/kaggle/kaggle-MABe` 为工作目录，并依赖多个外部输入。核心目录结构如下：
+
+```
+/kaggle/kaggle-MABe/
+├── mabe-final.py                # 最终方案脚本
+├── baseline/mabe-baseline.py    # 起始 baseline
+├── README.md, requirements.txt
+└── __pycache__/
+```
+
+外部数据与预训练资源位于 `/kaggle/input`，主要包含：
+
+```
+/kaggle/input/
+└── MABe-mouse-behavior-detection/        # 官方训练/测试 CSV 与追踪 parquet
+```
+
+若需通过 `LOAD_MODELS=True` 或 `LOAD_THRESHOLDS=True` 直接复用已训练结果，请确保上述目录保持默认结构，或在运行前修改脚本中的 `MODEL_LOAD_DIR`、`THRESHOLD_LOAD_DIR` 指向新的输入路径。
+
 ## 运行方式与参数开关
 
 ### 基本命令
