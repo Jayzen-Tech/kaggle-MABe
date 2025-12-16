@@ -1,5 +1,60 @@
 # kaggle-MABe
 
+## 目录结构与依赖数据
+项目以 `/kaggle/MABe` 为工作目录，并依赖多个外部输入。核心目录结构如下：
+
+```
+/kaggle/MABe/
+├── mabe-final.py                # 最终方案脚本
+├── baseline/mabe-baseline.py    # 起始 baseline
+├── models/                      # 训练或加载的模型缓存目录
+├── threshold/                   # 本地阈值缓存目录
+├── models-test/, model_upload.sh, run.sh, push.sh, permission.sh
+├── README.md, requirements.txt
+└── __pycache__/
+```
+
+外部数据与预训练资源位于 `/kaggle/input`，主要包含：
+
+```
+/kaggle/input/
+├── MABe-mouse-behavior-detection/        # 官方训练/测试 CSV 与追踪 parquet
+├── xgb-models-new/other/xgb-models-new/  # 预存模型与阈值（可通过 LOAD_* 开关使用）
+├── transformers-models/, transformers-threshold/（备用资源）
+```
+
+若需通过 `LOAD_MODELS=True` 或 `LOAD_THRESHOLDS=True` 直接复用已训练结果，请确保上述目录保持默认结构，或在运行前修改脚本中的 `MODEL_LOAD_DIR`、`THRESHOLD_LOAD_DIR` 指向新的输入路径。
+
+## 运行方式与参数开关
+
+### 基本命令
+1. （首次运行可选）安装依赖：`pip install -r requirements.txt`
+2. 执行脚本：`python mabe-final.py`
+
+脚本内部通过一组 runtime switches 控制训练 / 推理流程。它们位于 `mabe-final.py` 顶部，可按当前实验需求修改：
+
+```python
+# ---- runtime switches ----
+ONLY_TUNE_THRESHOLDS = True     # True: 仅搜索阈值并保存；跳过训练/推理/提交
+USE_ADAPTIVE_THRESHOLDS = True  # False: 所有动作使用固定 0.27 阈值
+LOAD_THRESHOLDS = False         # True: 从 THRESHOLD_DIR 读取现有阈值，跳过调参
+LOAD_MODELS = False             # True: 从 MODEL_DIR 读取已训练模型
+CHECK_LOAD = False              # True: 载入模型后过滤掉当前训练集中无正样本的动作
+THRESHOLD_DIR = "./models/threshold"
+MODEL_DIR = "./models"
+THRESHOLD_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/13/threshold"
+MODEL_LOAD_DIR = "/kaggle/input/xgb-models-new/other/xgb-models-new/13"
+NON_FINITE_LOG = "non_finite_features.log"
+```
+
+**使用建议：**
+- **全量训练+推理**：将 `ONLY_TUNE_THRESHOLDS=False`，`LOAD_MODELS=False`，脚本会先训练再预测，并把模型/阈值保存到 `MODEL_DIR`、`THRESHOLD_DIR`。
+- **仅调阈值**：当模型已训练好，仅希望在当前折数上重新搜索阈值时，把 `ONLY_TUNE_THRESHOLDS=True`（默认），执行会停止在阈值阶段并把结果写入 `THRESHOLD_DIR`。
+- **复用既有模型**：设置 `LOAD_MODELS=True`（必要时 `CHECK_LOAD=True` 验证数据兼容），脚本直接从 `MODEL_LOAD_DIR` 读取 `joblib` 缓存；若文件在自定义位置，请同步更新 `MODEL_LOAD_DIR`。
+- **复用阈值**：将 `LOAD_THRESHOLDS=True`，脚本会跳过调参并读取 `THRESHOLD_LOAD_DIR` 中的 `.pkl` 阈值文件。
+- `USE_ADAPTIVE_THRESHOLDS=False` 时会退回到全局 0.27 阈值，适用于快速 sanity check。
+- `NON_FINITE_LOG` 指向的日志文件记录任何训练/推理特征中出现的 NaN/Inf，便于检测数据问题，可根据需要更改路径或清空。
+
 ## 最终方案特征工程改进总览
 `mabe-final.py` 针对特征工程进行了系统性升级，覆盖数据清洗、元信息编码、三鼠上下文、单鼠/双鼠运动模式以及训练推理阶段的一致化。本节按照改动类别逐一说明，并附上核心代码片段（均节选自 `mabe-final.py`，仅展示与 baseline 相比新增或改写的部分）。
 
