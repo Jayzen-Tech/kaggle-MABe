@@ -1,5 +1,19 @@
 # kaggle-MABe
 
+## Table of Contents / 目录
+- [English Version](#english-version)
+  - [Directory Layout & Required Data](#directory-layout--required-data)
+  - [How to Run & Switches](#how-to-run--switches)
+  - [Feature Engineering Upgrades Overview](#feature-engineering-upgrades-overview)
+  - [Tracking Cleanup & Pixel Normalization](#1-tracking-cleanup--pixel-normalization)
+  - [Meta Encoding & Feature Augmentation](#2-meta-encoding--feature-augmentation)
+  - [Third-Mouse Context](#3-third-mouse-context-triadic-relations)
+  - [Single-Mouse Advanced Motion](#4-single-mouse-advanced-motion-long-horizon--pastfuture)
+  - [Pair Interaction Enhancements](#5-pair-interaction-enhancements--context-ratios)
+  - [Train/Test Consistency](#6-traintest-consistency--non-finite-logging)
+  - [Adaptive Threshold Strategy](#7-adaptive-threshold-tuning--inference-strategy)
+- [中文版](#中文版)
+
 ## English Version
 
 ### Directory Layout & Required Data
